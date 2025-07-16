@@ -1,0 +1,41 @@
+[project]
+name = "video-3d-pipeline"
+version = "0.1.0"
+description = "Convert 1080p 3D releases to 4K 3D using depth extraction and upscaling"
+authors = [
+    {name = "Video3D Team"}
+]
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "opencv-python>=4.8.0",
+    "ffmpeg-python>=0.2.0", 
+    "numpy>=1.24.0",
+    "matplotlib>=3.7.0",
+    "tqdm>=4.65.0",
+    "pillow>=10.0.0",
+    "scikit-image>=0.21.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4.0",
+    "black>=23.0.0",
+    "ruff>=0.0.290",
+]
+
+[project.scripts]
+video-align = "video_3d_pipeline.align:main"
+video-3d-convert = "video_3d_pipeline.convert:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.ruff]
+line-length = 88
+target-version = "py310"
+
+[tool.black]
+line-length = 88
+target-version = ['py310']
