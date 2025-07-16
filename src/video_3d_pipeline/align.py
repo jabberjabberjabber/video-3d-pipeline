@@ -1,4 +1,4 @@
-"""Temporal alignment of videos with different resolutions."""
+"""Temporal alignment of videos using audio correlation."""
 
 import cv2
 import numpy as np
@@ -8,16 +8,22 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 from typing import Tuple
 
-from .utils import get_video_info, extract_frames, create_work_directory, compute_frame_correlation
+from .utils import (get_video_info, create_work_directory, extract_audio, 
+                   load_audio_for_sync, find_audio_offset, plot_audio_correlation,
+                   verify_video_compatibility)
 
 
 class VideoAligner:
-    """ Handles temporal alignment between two videos of different resolutions """
+    """ Handles temporal alignment between two videos using audio correlation """
     
     def __init__(self, video1_path: str, video2_path: str, work_dir: str = "temp_alignment"):
         self.video1_path = video1_path
         self.video2_path = video2_path
         self.work_dir = create_work_directory(work_dir)
+        
+        # Verify video compatibility first
+        if not verify_video_compatibility(video1_path, video2_path):
+            print("Warning: Videos may not be compatible for accurate synchronization")
         
         # Get video info
         self.video1_info = get_video_info(video1_path)
@@ -31,93 +37,47 @@ class VideoAligner:
         print(f"Video 2: {self.video2_info['width']}x{self.video2_info['height']} "
               f"@ {self.video2_info['fps']:.2f} fps, {self.video2_info['duration']:.1f}s")
 
-    def find_best_alignment(self, frames1, timestamps1, frames2, timestamps2) -> Tuple[int, float]:
-        """ Find best temporal alignment between two sets of keyframes """
-        best_score = -1
-        best_offset = 0
-        scores = []
-        offsets = []
+    def find_audio_alignment(self, max_audio_length: float = 300) -> Tuple[float, float]:
+        """ Find best temporal alignment using audio cross-correlation """
         
-        print("Finding temporal alignment...")
+        # Extract audio from both videos
+        audio1_path = extract_audio(self.video1_path, self.work_dir, max_audio_length)
+        audio2_path = extract_audio(self.video2_path, self.work_dir, max_audio_length)
         
-        # Try different offsets and compute correlation
-        max_offset = min(len(frames1), len(frames2)) // 2
+        # Load audio waveforms
+        audio1, sr1 = load_audio_for_sync(audio1_path, max_audio_length)
+        audio2, sr2 = load_audio_for_sync(audio2_path, max_audio_length)
         
-        for offset in range(-max_offset, max_offset):
-            score = self._compute_alignment_score(frames1, frames2, offset)
-            scores.append(score)
-            offsets.append(offset)
-            
-            if score > best_score:
-                best_score = score
-                best_offset = offset
-                
-        print(f"Best alignment: offset={best_offset} frames, score={best_score:.4f}")
+        # Verify sample rates match
+        if sr1 != sr2:
+            print(f"Warning: Sample rate mismatch: {sr1} vs {sr2}")
         
-        # Plot alignment scores
-        self._plot_alignment_scores(offsets, scores, best_offset)
+        # Find optimal offset using cross-correlation
+        time_offset, correlation_strength = find_audio_offset(audio1, audio2, sr1)
         
-        return best_offset, best_score
+        # Create visualization
+        plot_audio_correlation(audio1, audio2, sr1, time_offset, self.work_dir)
+        
+        print(f"Audio alignment: {time_offset:.3f}s offset, strength: {correlation_strength:.4f}")
+        
+        return time_offset, correlation_strength
 
-    def _compute_alignment_score(self, frames1, frames2, offset: int) -> float:
-        """ Compute alignment score for given offset """
-        if offset >= 0:
-            f1_start, f2_start = offset, 0
-        else:
-            f1_start, f2_start = 0, -offset
-            
-        # Compare overlapping frames
-        overlap_length = min(len(frames1) - f1_start, len(frames2) - f2_start, 20)
-        
-        if overlap_length < 5:  # Need minimum overlap
-            return 0
-            
-        total_score = 0
-        valid_comparisons = 0
-        
-        for i in range(overlap_length):
-            f1_idx = f1_start + i
-            f2_idx = f2_start + i
-            
-            if f1_idx < len(frames1) and f2_idx < len(frames2):
-                corr = compute_frame_correlation(frames1[f1_idx], frames2[f2_idx])
-                total_score += corr
-                valid_comparisons += 1
-                
-        return total_score / valid_comparisons if valid_comparisons > 0 else 0
-
-    def _plot_alignment_scores(self, offsets, scores, best_offset):
-        """ Plot alignment scores and save to work directory """
-        plt.figure(figsize=(12, 6))
-        plt.plot(offsets, scores)
-        plt.xlabel('Frame Offset')
-        plt.ylabel('Alignment Score')
-        plt.title('Temporal Alignment Scores')
-        plt.axvline(x=best_offset, color='red', linestyle='--', 
-                   label=f'Best offset: {best_offset}')
-        plt.legend()
-        plt.grid(True)
-        plt.savefig(self.work_dir / 'alignment_scores.png', dpi=150, bbox_inches='tight')
-        plt.close()
-
-    def extract_aligned_segments(self, offset_frames: int, duration_seconds: int = 60) -> Tuple[str, str]:
-        """ Extract aligned segments from both videos """
-        # Convert frame offset to time offset
-        fps1 = self.video1_info['fps']
-        fps2 = self.video2_info['fps']
+    def extract_aligned_segments(self, time_offset: float, duration_seconds: int = 60) -> Tuple[str, str]:
+        """ Extract aligned segments from both videos using audio-derived offset """
         
         # Find a good starting point (avoid beginning/end of videos)
-        min_start_time = max(10, abs(offset_frames / fps1) if offset_frames < 0 else 0)
-        max_end_time = min(self.video1_info['duration'], self.video2_info['duration']) - duration_seconds - 10
+        min_duration = min(self.video1_info['duration'], self.video2_info['duration'])
+        max_start_time = min_duration - duration_seconds - 10
         
-        if min_start_time >= max_end_time:
-            raise ValueError("Videos too short or offset too large for requested duration")
-            
-        start_time = min_start_time
+        # Start from 10 seconds to avoid any intro/fade differences
+        start_time = max(10, min(60, max_start_time / 2))  # Start partway through
+        
+        if start_time >= max_start_time:
+            raise ValueError("Videos too short for requested duration")
         
         print(f"Extracting {duration_seconds}s segments starting at {start_time:.1f}s...")
         
-        # Extract from video1
+        # Extract from video1 at start_time
         output1 = self.work_dir / f"video1_aligned_{int(start_time)}s.mp4"
         (
             ffmpeg
@@ -127,8 +87,12 @@ class VideoAligner:
             .run(quiet=True)
         )
         
-        # Extract from video2 with offset
-        video2_start = start_time + (offset_frames / fps2)
+        # Extract from video2 with time offset applied
+        video2_start = start_time - time_offset  # Apply the offset
+        if video2_start < 0:
+            video2_start = 0
+            print(f"Warning: Adjusted video2 start time to 0 (was {video2_start:.1f}s)")
+        
         output2 = self.work_dir / f"video2_aligned_{int(start_time)}s.mp4"
         (
             ffmpeg
@@ -139,73 +103,55 @@ class VideoAligner:
         )
         
         print(f"Aligned segments saved:")
-        print(f"  Video 1: {output1}")
-        print(f"  Video 2: {output2}")
+        print(f"  Video 1: {output1} (start: {start_time:.1f}s)")
+        print(f"  Video 2: {output2} (start: {video2_start:.1f}s)")
         
         return str(output1), str(output2)
 
     def verify_alignment(self, video1_segment: str, video2_segment: str, num_frames: int = 10) -> float:
-        """ Verify frame-by-frame alignment of extracted segments """
-        cap1 = cv2.VideoCapture(video1_segment)
-        cap2 = cv2.VideoCapture(video2_segment)
+        """ Verify alignment quality by checking audio correlation of segments """
         
-        frame_count1 = int(cap1.get(cv2.CAP_PROP_FRAME_COUNT))
-        frame_count2 = int(cap2.get(cv2.CAP_PROP_FRAME_COUNT))
+        # Extract audio from both segments
+        seg1_audio_path = extract_audio(video1_segment, self.work_dir, 60)
+        seg2_audio_path = extract_audio(video2_segment, self.work_dir, 60)
         
-        print(f"Verifying alignment...")
-        print(f"Segment 1 frames: {frame_count1}")
-        print(f"Segment 2 frames: {frame_count2}")
+        # Load audio
+        audio1, sr1 = load_audio_for_sync(seg1_audio_path, 60)
+        audio2, sr2 = load_audio_for_sync(seg2_audio_path, 60)
         
-        # Check frames at regular intervals
-        verification_scores = []
-        frame_indices = np.linspace(0, min(frame_count1, frame_count2) - 1, num_frames, dtype=int)
+        # Check correlation at zero offset (should be high if aligned)
+        min_len = min(len(audio1), len(audio2))
+        audio1_trim = audio1[:min_len]
+        audio2_trim = audio2[:min_len]
         
-        for frame_idx in frame_indices:
-            cap1.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
-            cap2.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
-            
-            ret1, frame1 = cap1.read()
-            ret2, frame2 = cap2.read()
-            
-            if ret1 and ret2:
-                # Convert to grayscale
-                gray1 = cv2.cvtColor(frame1, cv2.COLOR_BGR2GRAY)
-                gray2 = cv2.cvtColor(frame2, cv2.COLOR_BGR2GRAY)
-                
-                corr = compute_frame_correlation(gray1, gray2)
-                verification_scores.append(corr)
-                
-                print(f"Frame {frame_idx}: correlation = {corr:.4f}")
+        # Compute correlation coefficient
+        correlation = np.corrcoef(audio1_trim, audio2_trim)[0, 1]
         
-        cap1.release()
-        cap2.release()
+        print(f"Segment audio correlation: {correlation:.4f}")
         
-        avg_score = np.mean(verification_scores)
-        print(f"\nAverage correlation: {avg_score:.4f}")
-        
-        if avg_score > 0.8:
+        if correlation > 0.8:
             print("✓ Excellent alignment!")
-        elif avg_score > 0.6:
+        elif correlation > 0.6:
             print("✓ Good alignment")
-        elif avg_score > 0.4:
+        elif correlation > 0.4:
             print("⚠ Moderate alignment - may need adjustment")
         else:
             print("✗ Poor alignment - check source videos")
-            
-        return avg_score
+        
+        return correlation
 
 
 def main():
-    """ Command line interface for video alignment """
-    parser = argparse.ArgumentParser(description='Temporally align two videos of different resolutions')
+    """ Command line interface for video alignment using audio correlation """
+    parser = argparse.ArgumentParser(description='Align two videos using audio correlation')
     parser.add_argument('video1', help='Path to first video')
     parser.add_argument('video2', help='Path to second video')
     parser.add_argument('--duration', type=int, default=60, 
                        help='Duration of segments to extract (seconds)')
     parser.add_argument('--work-dir', default='temp_alignment', 
                        help='Working directory for temporary files')
-    parser.add_argument('--interval', type=float, default=1.0,
-                       help='Keyframe extraction interval (seconds)')
+    parser.add_argument('--max-audio', type=float, default=300.0,
+                       help='Maximum audio length for sync analysis (seconds)')
     
     args = parser.parse_args()
     
@@ -213,30 +159,28 @@ def main():
         # Initialize aligner
         aligner = VideoAligner(args.video1, args.video2, args.work_dir)
         
-        # Extract keyframes for alignment
-        print("Extracting keyframes from video 1...")
-        frames1, timestamps1 = extract_frames(args.video1, args.interval)
+        # Find alignment using audio correlation
+        time_offset, correlation_strength = aligner.find_audio_alignment(args.max_audio)
         
-        print("Extracting keyframes from video 2...")  
-        frames2, timestamps2 = extract_frames(args.video2, args.interval)
-        
-        # Find best alignment
-        offset, score = aligner.find_best_alignment(frames1, timestamps1, frames2, timestamps2)
-        
-        if score < 0.3:
-            print("Warning: Low alignment score. Videos may not be suitable for alignment.")
-            return
+        if correlation_strength < 0.3:
+            print("Warning: Low audio correlation. Videos may not be from same source.")
+            response = input("Continue anyway? (y/n): ")
+            if response.lower() != 'y':
+                return 1
         
         # Extract aligned segments
-        seg1, seg2 = aligner.extract_aligned_segments(offset, args.duration)
+        seg1, seg2 = aligner.extract_aligned_segments(time_offset, args.duration)
         
-        # Verify alignment
+        # Verify alignment quality
         final_score = aligner.verify_alignment(seg1, seg2)
         
         if final_score > 0.6:
             print(f"\n✓ Success! Aligned segments ready for 3D processing.")
+            print(f"Audio correlation: {correlation_strength:.4f}")
+            print(f"Time offset: {time_offset:.3f}s")
         else:
             print(f"\n⚠ Alignment may need manual adjustment.")
+            print(f"Consider using different source videos or manual sync points.")
             
     except Exception as e:
         print(f"Error: {e}")

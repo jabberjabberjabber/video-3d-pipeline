@@ -7,12 +7,11 @@ from pathlib import Path
 from typing import Dict, List, Tuple, Optional
 import tempfile
 import os
-
-try:
-    import cupy as cp
-    CUDA_AVAILABLE = True
-except ImportError:
-    CUDA_AVAILABLE = False
+import hashlib
+import librosa
+from scipy import signal
+import soundfile as sf
+import matplotlib.pyplot as plt
 
 
 def get_video_info(video_path: str) -> Optional[Dict]:
@@ -39,139 +38,156 @@ def get_video_info(video_path: str) -> Optional[Dict]:
         return None
 
 
-def extract_frames(video_path: str, interval_seconds: float = 1.0, 
-                  resize_height: int = 480) -> Tuple[List, List]:
-    """ Extract frames efficiently using GPU acceleration and batched processing """
+def extract_audio(video_path: str, work_dir: Path, 
+                 duration_seconds: float = 600, sample_rate: int = 22050) -> str:
+    """ Extract audio from video for sync analysis with caching """
     
-    # Get video info
-    video_info = get_video_info(video_path)
-    if not video_info:
-        raise ValueError(f"Could not get video info for: {video_path}")
+    # Create cache filename based on video path and parameters
+    video_hash = hashlib.md5(f"{video_path}_{duration_seconds}_{sample_rate}".encode()).hexdigest()[:16]
+    audio_cache_path = work_dir / f"audio_cache_{video_hash}.wav"
     
-    duration = video_info['duration']
-    width = video_info['width']
-    height = video_info['height']
+    # Check if cached audio exists and is newer than video
+    if audio_cache_path.exists():
+        video_mtime = os.path.getmtime(video_path)
+        audio_mtime = os.path.getmtime(audio_cache_path)
+        if audio_mtime > video_mtime:
+            print(f"Using cached audio: {audio_cache_path}")
+            return str(audio_cache_path)
     
-    # Calculate target dimensions maintaining aspect ratio
-    new_width = int(width * resize_height / height)
+    print(f"Extracting audio from {video_path}...")
     
-    # Generate timestamps - but be more conservative to avoid overheating
-    max_frames = min(300, int(duration / interval_seconds))  # Limit to 300 frames max
-    if max_frames < 10:
-        max_frames = min(60, int(duration))  # At least try for 60 frames
+    # Extract audio using FFmpeg
+    # Only extract first portion to save time/space
+    (
+        ffmpeg
+        .input(video_path, t=duration_seconds)
+        .output(str(audio_cache_path), 
+               acodec='pcm_s16le', 
+               ar=sample_rate, 
+               ac=1,  # mono
+               y='-')  # overwrite
+        .run(quiet=True)
+    )
+    
+    if not audio_cache_path.exists():
+        raise ValueError(f"Failed to extract audio from {video_path}")
         
-    target_times = np.linspace(10, duration - 10, max_frames)  # Avoid start/end
-    
-    print(f"Extracting {len(target_times)} keyframes from {duration:.1f}s video (GPU accelerated)...")
-    
-    frames = []
-    timestamps = []
-    
-    # Check if we can use CUDA acceleration
-    use_cuda = CUDA_AVAILABLE and cv2.cuda.getCudaEnabledDeviceCount() > 0
-    if use_cuda:
-        print("Using CUDA GPU acceleration")
-    
-    # Process in batches to avoid thermal issues
-    batch_size = 20  # Process 20 frames at a time
-    for batch_start in range(0, len(target_times), batch_size):
-        batch_end = min(batch_start + batch_size, len(target_times))
-        batch_times = target_times[batch_start:batch_end]
-        
-        print(f"Processing batch {batch_start//batch_size + 1}/{(len(target_times)-1)//batch_size + 1}")
-        
-        # Extract this batch using a single FFmpeg call
-        batch_frames, batch_timestamps = _extract_frame_batch(
-            video_path, batch_times, new_width, resize_height, use_cuda
-        )
-        
-        frames.extend(batch_frames)
-        timestamps.extend(batch_timestamps)
-    
-    if not frames:
-        raise ValueError("No frames could be extracted from video")
-        
-    print(f"Successfully extracted {len(frames)} frames")
-    return frames, timestamps
+    return str(audio_cache_path)
 
 
-def _extract_frame_batch(video_path: str, timestamps: np.ndarray, 
-                        new_width: int, resize_height: int, use_cuda: bool) -> Tuple[List, List]:
-    """ Extract a batch of frames using GPU acceleration """
-    frames = []
-    batch_timestamps = []
+def load_audio_for_sync(audio_path: str, max_length_seconds: float = 300) -> Tuple[np.ndarray, int]:
+    """ Load audio waveform for synchronization analysis """
     
-    with tempfile.TemporaryDirectory() as temp_dir:
-        # Extract all frames in this batch to temporary files
-        for i, timestamp in enumerate(timestamps):
-            output_file = os.path.join(temp_dir, f"frame_{i:04d}.jpg")
-            
-            try:
-                # Use CUDA decoder if available
-                input_args = {}
-                if use_cuda:
-                    input_args['hwaccel'] = 'cuda'
-                    input_args['hwaccel_output_format'] = 'cuda'
-                
-                (
-                    ffmpeg
-                    .input(video_path, ss=timestamp, **input_args)
-                    .output(output_file, vframes=1, qscale=2, s=f'{new_width}x{resize_height}')
-                    .run(quiet=True, overwrite_output=True)
-                )
-                
-                # Read and process the frame
-                if os.path.exists(output_file):
-                    if use_cuda:
-                        frame = _read_frame_gpu(output_file)
-                    else:
-                        frame = _read_frame_cpu(output_file)
-                    
-                    if frame is not None:
-                        frames.append(frame)
-                        batch_timestamps.append(timestamp)
-                        
-            except Exception as e:
-                print(f"Warning: Failed to extract frame at {timestamp:.1f}s: {e}")
-                continue
+    # Load audio with librosa
+    audio, sr = librosa.load(audio_path, sr=None, mono=True)
     
-    return frames, batch_timestamps
+    # Limit to max_length to keep processing fast
+    max_samples = int(max_length_seconds * sr)
+    if len(audio) > max_samples:
+        audio = audio[:max_samples]
+        print(f"Limited audio to {max_length_seconds}s for sync analysis")
+    
+    return audio, sr
 
 
-def _read_frame_gpu(image_path: str) -> Optional[np.ndarray]:
-    """ Read and process frame using GPU """
-    try:
-        # Read image on CPU first
-        img_cpu = cv2.imread(image_path)
-        if img_cpu is None:
-            return None
-            
-        # Upload to GPU
-        img_gpu = cv2.cuda_GpuMat()
-        img_gpu.upload(img_cpu)
-        
-        # Convert to grayscale on GPU
-        gray_gpu = cv2.cuda.cvtColor(img_gpu, cv2.COLOR_BGR2GRAY)
-        
-        # Download result back to CPU
-        gray_cpu = gray_gpu.download()
-        
-        return gray_cpu
-        
-    except Exception as e:
-        print(f"GPU processing failed, falling back to CPU: {e}")
-        return _read_frame_cpu(image_path)
+def find_audio_offset(audio1: np.ndarray, audio2: np.ndarray, sr: int) -> Tuple[float, float]:
+    """ Find time offset between two audio tracks using cross-correlation """
+    
+    print("Computing audio cross-correlation...")
+    
+    # Normalize audio to prevent overflow
+    audio1_norm = audio1 / (np.max(np.abs(audio1)) + 1e-10)
+    audio2_norm = audio2 / (np.max(np.abs(audio2)) + 1e-10)
+    
+    # Cross-correlate the signals
+    correlation = signal.correlate(audio2_norm, audio1_norm, mode='full')
+    
+    # Find peak correlation
+    max_corr_idx = np.argmax(np.abs(correlation))
+    max_corr_value = correlation[max_corr_idx]
+    
+    # Convert sample offset to time offset
+    sample_offset = max_corr_idx - len(audio1) + 1
+    time_offset = sample_offset / sr
+    
+    # Correlation strength (normalized)
+    correlation_strength = float(np.abs(max_corr_value)) / len(audio1)
+    
+    print(f"Audio offset: {time_offset:.3f}s, correlation strength: {correlation_strength:.4f}")
+    
+    return time_offset, correlation_strength
 
 
-def _read_frame_cpu(image_path: str) -> Optional[np.ndarray]:
-    """ Read and process frame using CPU """
-    try:
-        img = cv2.imread(image_path)
-        if img is None:
-            return None
-        return cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    except:
-        return None
+def plot_audio_correlation(audio1: np.ndarray, audio2: np.ndarray, sr: int, 
+                          time_offset: float, work_dir: Path):
+    """ Plot audio waveforms and correlation for visualization """
+    
+    fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(12, 8))
+    
+    # Plot audio waveforms
+    time1 = np.arange(len(audio1)) / sr
+    time2 = np.arange(len(audio2)) / sr
+    
+    ax1.plot(time1, audio1, alpha=0.7, label='Video 1')
+    ax1.set_ylabel('Amplitude')
+    ax1.set_title('Audio Waveform - Video 1')
+    ax1.grid(True)
+    
+    ax2.plot(time2, audio2, alpha=0.7, label='Video 2', color='orange')
+    ax2.set_ylabel('Amplitude')
+    ax2.set_title('Audio Waveform - Video 2')
+    ax2.grid(True)
+    
+    # Plot correlation
+    correlation = signal.correlate(audio2, audio1, mode='full')
+    corr_time = (np.arange(len(correlation)) - len(audio1) + 1) / sr
+    
+    ax3.plot(corr_time, correlation)
+    ax3.axvline(time_offset, color='red', linestyle='--', 
+               label=f'Best offset: {time_offset:.3f}s')
+    ax3.set_xlabel('Time Offset (seconds)')
+    ax3.set_ylabel('Correlation')
+    ax3.set_title('Audio Cross-Correlation')
+    ax3.legend()
+    ax3.grid(True)
+    
+    plt.tight_layout()
+    plt.savefig(work_dir / 'audio_sync_analysis.png', dpi=150, bbox_inches='tight')
+    plt.close()
+
+
+def verify_video_compatibility(video1_path: str, video2_path: str) -> bool:
+    """ Check if videos are compatible for sync (duration, frame rate, etc.) """
+    
+    info1 = get_video_info(video1_path)
+    info2 = get_video_info(video2_path)
+    
+    if not info1 or not info2:
+        print("Error: Could not read video information")
+        return False
+    
+    # Check durations (should be within 2% of each other)
+    duration_diff = abs(info1['duration'] - info2['duration'])
+    duration_ratio = duration_diff / max(info1['duration'], info2['duration'])
+    
+    if duration_ratio > 0.02:  # More than 2% difference
+        print(f"Warning: Large duration difference: {info1['duration']:.1f}s vs {info2['duration']:.1f}s")
+        print("Videos may not be from the same source")
+        return False
+    
+    # Check frame rates (should be identical or very close)
+    fps_diff = abs(info1['fps'] - info2['fps'])
+    if fps_diff > 0.1:
+        print(f"Warning: Frame rate mismatch: {info1['fps']:.2f} vs {info2['fps']:.2f}")
+        print("Consider re-encoding one video to match frame rates")
+        return False
+    
+    print("✓ Videos appear compatible for synchronization")
+    print(f"  Duration: {info1['duration']:.1f}s vs {info2['duration']:.1f}s")
+    print(f"  Frame rate: {info1['fps']:.2f} vs {info2['fps']:.2f}")
+    print(f"  Resolution: {info1['width']}x{info1['height']} vs {info2['width']}x{info2['height']}")
+    
+    return True
 
 
 def create_work_directory(base_path: str = "temp_pipeline") -> Path:
@@ -179,17 +195,3 @@ def create_work_directory(base_path: str = "temp_pipeline") -> Path:
     work_dir = Path(base_path)
     work_dir.mkdir(exist_ok=True)
     return work_dir
-
-
-def compute_frame_correlation(frame1, frame2) -> float:
-    """ Compute normalized cross-correlation between two frames """
-    # Resize frames to same size
-    h1, w1 = frame1.shape
-    h2, w2 = frame2.shape
-    target_h, target_w = min(h1, h2), min(w1, w2)
-    
-    frame1_resized = cv2.resize(frame1, (target_w, target_h))
-    frame2_resized = cv2.resize(frame2, (target_w, target_h))
-    
-    # Compute normalized cross-correlation
-    return cv2.matchTemplate(frame1_resized, frame2_resized, cv2.TM_CCOEFF_NORMED)[0][0]

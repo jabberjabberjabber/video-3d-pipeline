@@ -58,6 +58,11 @@ temp_pipeline/
 *.flv
 *.webm
 *.m4v
+*.wav
+*.mp3
+*.flac
+*.aac
+audio_cache_*.wav
 
 # Logs and debug
 *.log

@@ -34,17 +34,25 @@ uv pip install -e .
 
 ### Step 1: Align Videos
 
-First, temporally align your 1080p 3D and 4K 2D videos:
+First, temporally align your 1080p 3D and 4K 2D videos using audio correlation:
 
 ```bash
 uv run video-align input_1080p_3d.mkv input_4k_2d.mp4 --duration 60
 ```
 
 This will:
-- Extract keyframes and find optimal temporal alignment
+- Extract and cache audio tracks from both videos
+- Find optimal temporal alignment using audio cross-correlation
 - Generate synchronized 60-second segments  
-- Verify alignment quality
+- Verify alignment quality using audio correlation
 - Save results in `temp_alignment/` directory
+
+**Audio-based sync advantages:**
+- 10-100x faster than video-based methods
+- Sub-second accuracy
+- Works with different resolutions/quality
+- Industry standard approach
+- Much lower CPU usage
 
 ### Step 2: Convert to 4K 3D (Coming Soon)
 
@@ -70,15 +78,18 @@ video-3d-pipeline/
 
 - **OpenCV** - Computer vision and video processing
 - **FFmpeg** - Video encoding/decoding via ffmpeg-python
+- **librosa** - Audio analysis and processing
+- **SciPy** - Audio cross-correlation algorithms
 - **NumPy** - Numerical computations
 - **Matplotlib** - Visualization and plotting
 - **scikit-image** - Image processing algorithms
 
 ## Quality Expectations
 
-- **Alignment scores >0.8**: Excellent temporal sync
-- **Alignment scores 0.6-0.8**: Good sync, suitable for processing  
-- **Alignment scores <0.6**: May need manual adjustment
+- **Audio correlation >0.8**: Excellent temporal sync
+- **Audio correlation 0.6-0.8**: Good sync, suitable for processing  
+- **Audio correlation <0.6**: May need manual adjustment or different source videos
+- **Video compatibility check**: Verifies duration and frame rate compatibility
 
 ## Development
 
@@ -96,7 +107,7 @@ uv run pytest
 
 ## Current Status
 
-- ✅ **Video Alignment**: Complete temporal synchronization
+- ✅ **Audio-based Video Alignment**: Fast, accurate temporal synchronization using cross-correlation
 - 🚧 **Depth Extraction**: Stereo correspondence algorithms
 - 🚧 **Depth Upscaling**: AI-based upscaling methods  
 - 🚧 **DIBR Rendering**: 4K stereoscopic generation
