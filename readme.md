@@ -6,6 +6,23 @@ Convert 1080p 3D video releases to 4K 3D using depth extraction and upscaling.
 
 This project extracts depth information from existing 1080p stereoscopic 3D releases and applies it to 4K 2D versions of the same content to create high-quality 4K 3D video.
 
+### Why?
+
+Stereo depth extraction from existing 3D:
+
+✅ Real geometric depth from actual binocular disparity
+✅ Sub-pixel accuracy from stereo correspondence
+✅ Consistent depth across frames (no flickering)
+✅ Fast processing - just computer vision algorithms
+
+
+Monocular depth inference (what most people do):
+
+❌ Guessed depth from single image cues
+❌ Heavy neural network inference on every frame
+❌ Temporal inconsistency between frames
+❌ Slow GPU inference for large models
+
 ### Pipeline Steps
 
 1. **Temporal Alignment** - Synchronize 1080p 3D and 4K 2D videos
