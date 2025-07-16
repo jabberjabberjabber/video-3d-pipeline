@@ -8,19 +8,25 @@ This project extracts depth information from existing 1080p stereoscopic 3D rele
 
 ### Why?
 
-Stereo depth extraction from existing 3D:
+**Stereo depth extraction from existing 3D:**
 
 ✅ Real geometric depth from actual binocular disparity
+
 ✅ Sub-pixel accuracy from stereo correspondence
+
 ✅ Consistent depth across frames (no flickering)
+
 ✅ Fast processing - just computer vision algorithms
 
 
-Monocular depth inference (what most people do):
+**Monocular depth inference:**
 
 ❌ Guessed depth from single image cues
+
 ❌ Heavy neural network inference on every frame
+
 ❌ Temporal inconsistency between frames
+
 ❌ Slow GPU inference for large models
 
 ### Pipeline Steps
