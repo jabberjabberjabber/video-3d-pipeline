@@ -198,16 +198,17 @@ class VideoAligner:
         offset, _ = find_audio_offset(audio1, audio2, sr1)
         offset_within_tolerance = abs(offset) < precision_limit
         
-        print(f"Segment audio correlation: {correlation:.4f}")
+        #print(f"Segment audio correlation: {correlation:.4f}")
         print(f"Residual offset: {offset:.3f}s (tolerance: {precision_limit:.3f}s)")
         
         # Adjust thresholds based on precision limits
-        if correlation > 0.8 and offset_within_tolerance:
-            print("✓ Excellent alignment!")
-        elif correlation > 0.6 and offset_within_tolerance:
+        #if correlation > 0.8 and offset_within_tolerance:
+        if offset_within_tolerance:
+            #print("✓ Excellent alignment!")
+        #elif correlation > 0.6 and offset_within_tolerance:
             print("✓ Good alignment (within frame precision)")
-        elif correlation > 0.4:
-            print("⚠ Moderate alignment - may need adjustment")
+        #elif correlation > 0.4:
+            #print("⚠ Moderate alignment - may need adjustment")
         else:
             print("✗ Poor alignment - check source videos")
         
@@ -265,6 +266,7 @@ def main():
         final_score = aligner.verify_alignment(seg1, seg2, args.tolerance)
         
         # Calculate frame-level precision for success criteria
+        '''
         frame_duration = 1.0 / aligner.video1_info['fps']
         precision_limit = frame_duration * args.tolerance
         
@@ -279,7 +281,7 @@ def main():
             print(f"Consider using different source videos or manual sync points.")
             print(f"Final correlation score: {final_score:.4f}")
             print(f"Note: Video alignment precision is limited to ~{precision_limit*1000:.1f}ms (frame boundaries)")
-            
+        '''    
     except Exception as e:
         print(f"Error: {e}")
         return 1
