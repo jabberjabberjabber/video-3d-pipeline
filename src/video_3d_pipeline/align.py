@@ -10,7 +10,7 @@ from typing import Tuple
 
 from .utils import (get_video_info, create_work_directory, extract_audio, 
                    load_audio_for_sync, find_audio_offset, plot_audio_correlation,
-                   verify_video_compatibility)
+                   verify_video_compatibility, calculate_audio_correlation)
 
 
 class VideoAligner:
@@ -76,39 +76,107 @@ class VideoAligner:
             raise ValueError("Videos too short for requested duration")
         
         print(f"Extracting {duration_seconds}s segments starting at {start_time:.1f}s...")
+        print(f"Time offset found: {time_offset:.3f}s")
         
-        # Extract from video1 at start_time
-        output1 = self.work_dir / f"video1_aligned_{int(start_time)}s.mp4"
-        (
-            ffmpeg
-            .input(self.video1_path, ss=start_time, t=duration_seconds)
-            .output(str(output1), vcodec='libx264', crf=18, preset='medium')
-            .overwrite_output()
-            .run(quiet=True)
-        )
+        # Apply offset correctly:
+        # If time_offset is negative, video1 is ahead of video2
+        # So we need to start video2 extraction earlier (at a smaller timestamp)
+        # If time_offset is positive, video1 is behind video2  
+        # So we need to start video2 extraction later (at a larger timestamp)
+        video2_start = start_time + time_offset
         
-        # Extract from video2 with time offset applied
-        video2_start = start_time - time_offset  # Apply the offset
         if video2_start < 0:
             video2_start = 0
             print(f"Warning: Adjusted video2 start time to 0 (was {video2_start:.1f}s)")
         
-        output2 = self.work_dir / f"video2_aligned_{int(start_time)}s.mp4"
-        (
-            ffmpeg
-            .input(self.video2_path, ss=video2_start, t=duration_seconds)
-            .output(str(output2), vcodec='libx264', crf=18, preset='medium')
-            .overwrite_output()
-            .run(quiet=True)
-        )
+        print(f"Video1 segment: {start_time:.3f}s to {start_time + duration_seconds:.3f}s")
+        print(f"Video2 segment: {video2_start:.3f}s to {video2_start + duration_seconds:.3f}s")
+        
+        # Extract from video1 - use simple, accurate extraction
+        output1 = self.work_dir / f"video1_aligned_{duration_seconds}s.mp4"
+        print(f"Extracting video1 from {start_time:.3f}s...")
+        
+        try:
+            (
+                ffmpeg
+                .input(self.video1_path)
+                .output(str(output1), 
+                       ss=start_time,  # Precise seek
+                       t=duration_seconds,
+                       vcodec='libx264', 
+                       acodec='copy',  # Copy audio without re-encoding
+                       crf=18, 
+                       preset='medium',
+                       avoid_negative_ts='make_zero')
+                .overwrite_output()
+                .run(quiet=False, capture_stdout=True, capture_stderr=True)
+            )
+        except ffmpeg.Error as e:
+            print(f"FFmpeg error extracting video1:")
+            print(f"stderr: {e.stderr.decode() if e.stderr else 'None'}")
+            raise
+        
+        # Extract from video2 - use simple, accurate extraction
+        output2 = self.work_dir / f"video2_aligned_{duration_seconds}s.mp4"
+        print(f"Extracting video2 from {video2_start:.3f}s...")
+        
+        try:
+            (
+                ffmpeg
+                .input(self.video2_path)
+                .output(str(output2), 
+                       ss=video2_start,  # Precise seek
+                       t=duration_seconds,
+                       vcodec='libx264', 
+                       acodec='copy',  # Copy audio without re-encoding
+                       crf=18, 
+                       preset='medium',
+                       avoid_negative_ts='make_zero')
+                .overwrite_output()
+                .run(quiet=False, capture_stdout=True, capture_stderr=True)
+            )
+        except ffmpeg.Error as e:
+            print(f"FFmpeg error extracting video2:")
+            print(f"stderr: {e.stderr.decode() if e.stderr else 'None'}")
+            raise
         
         print(f"Aligned segments saved:")
-        print(f"  Video 1: {output1} (start: {start_time:.1f}s)")
-        print(f"  Video 2: {output2} (start: {video2_start:.1f}s)")
+        print(f"  Video 1: {output1} (start: {start_time:.3f}s)")
+        print(f"  Video 2: {output2} (start: {video2_start:.3f}s)")
         
         return str(output1), str(output2)
 
-    def verify_alignment(self, video1_segment: str, video2_segment: str, num_frames: int = 10) -> float:
+    def verify_extraction_timing(self, video1_segment: str, video2_segment: str) -> None:
+        """ Verify that the extracted segments have the correct timing """
+        
+        print("Verifying extraction timing...")
+        
+        # Get detailed info about the extracted segments
+        try:
+            # Check video1 segment
+            probe1 = ffmpeg.probe(video1_segment)
+            v1_duration = float(probe1['format']['duration'])
+            v1_start_time = float(probe1['format'].get('start_time', 0))
+            
+            # Check video2 segment  
+            probe2 = ffmpeg.probe(video2_segment)
+            v2_duration = float(probe2['format']['duration'])
+            v2_start_time = float(probe2['format'].get('start_time', 0))
+            
+            print(f"Video1 segment: duration={v1_duration:.3f}s, start_time={v1_start_time:.3f}s")
+            print(f"Video2 segment: duration={v2_duration:.3f}s, start_time={v2_start_time:.3f}s")
+            
+            # Check if durations match
+            duration_diff = abs(v1_duration - v2_duration)
+            if duration_diff > 0.1:  # More than 100ms difference
+                print(f"Warning: Duration mismatch: {duration_diff:.3f}s")
+            else:
+                print(f"✓ Durations match within {duration_diff:.3f}s")
+                
+        except Exception as e:
+            print(f"Error verifying extraction timing: {e}")
+
+    def verify_alignment(self, video1_segment: str, video2_segment: str, tolerance_frames: float = 2.0) -> float:
         """ Verify alignment quality by checking audio correlation of segments """
         
         # Extract audio from both segments
@@ -119,20 +187,25 @@ class VideoAligner:
         audio1, sr1 = load_audio_for_sync(seg1_audio_path, 60)
         audio2, sr2 = load_audio_for_sync(seg2_audio_path, 60)
         
-        # Check correlation at zero offset (should be high if aligned)
-        min_len = min(len(audio1), len(audio2))
-        audio1_trim = audio1[:min_len]
-        audio2_trim = audio2[:min_len]
+        # Use the same correlation calculation as the main alignment
+        correlation = calculate_audio_correlation(audio1, audio2)
         
-        # Compute correlation coefficient
-        correlation = np.corrcoef(audio1_trim, audio2_trim)[0, 1]
+        # Also check if there's still a small offset (within frame precision)
+        frame_duration = 1.0 / self.video1_info['fps']
+        precision_limit = frame_duration * tolerance_frames
+        
+        # Quick offset check to see if we're within tolerance
+        offset, _ = find_audio_offset(audio1, audio2, sr1)
+        offset_within_tolerance = abs(offset) < precision_limit
         
         print(f"Segment audio correlation: {correlation:.4f}")
+        print(f"Residual offset: {offset:.3f}s (tolerance: {precision_limit:.3f}s)")
         
-        if correlation > 0.8:
+        # Adjust thresholds based on precision limits
+        if correlation > 0.8 and offset_within_tolerance:
             print("✓ Excellent alignment!")
-        elif correlation > 0.6:
-            print("✓ Good alignment")
+        elif correlation > 0.6 and offset_within_tolerance:
+            print("✓ Good alignment (within frame precision)")
         elif correlation > 0.4:
             print("⚠ Moderate alignment - may need adjustment")
         else:
@@ -152,6 +225,8 @@ def main():
                        help='Working directory for temporary files')
     parser.add_argument('--max-audio', type=float, default=300.0,
                        help='Maximum audio length for sync analysis (seconds)')
+    parser.add_argument('--tolerance', type=float, default=2.0,
+                       help='Alignment tolerance in frame intervals (default: 2 frames)')
     
     args = parser.parse_args()
     
@@ -162,7 +237,19 @@ def main():
         # Find alignment using audio correlation
         time_offset, correlation_strength = aligner.find_audio_alignment(args.max_audio)
         
-        if correlation_strength < 0.3:
+        # Calculate frame-level precision limit
+        frame_duration = 1.0 / aligner.video1_info['fps']
+        precision_limit = frame_duration * args.tolerance  # Use configurable tolerance
+        
+        print(f"Frame precision limit: {precision_limit:.3f}s ({precision_limit*1000:.1f}ms)")
+        
+        # Check if offset is within acceptable precision
+        if abs(time_offset) < precision_limit:
+            print(f"✓ Offset {time_offset:.3f}s is within frame precision tolerance")
+            print(f"Videos are already well-aligned (within {precision_limit*1000:.1f}ms)")
+            return 0
+        
+        if correlation_strength < 0.6:
             print("Warning: Low audio correlation. Videos may not be from same source.")
             response = input("Continue anyway? (y/n): ")
             if response.lower() != 'y':
@@ -171,16 +258,27 @@ def main():
         # Extract aligned segments
         seg1, seg2 = aligner.extract_aligned_segments(time_offset, args.duration)
         
-        # Verify alignment quality
-        final_score = aligner.verify_alignment(seg1, seg2)
+        # Verify extraction timing
+        aligner.verify_extraction_timing(seg1, seg2)
         
-        if final_score > 0.6:
+        # Verify alignment quality
+        final_score = aligner.verify_alignment(seg1, seg2, args.tolerance)
+        
+        # Calculate frame-level precision for success criteria
+        frame_duration = 1.0 / aligner.video1_info['fps']
+        precision_limit = frame_duration * args.tolerance
+        
+        # Check final alignment success with realistic thresholds
+        if final_score > 0.6:  # Lower threshold since we account for frame precision
             print(f"\n✓ Success! Aligned segments ready for 3D processing.")
             print(f"Audio correlation: {correlation_strength:.4f}")
             print(f"Time offset: {time_offset:.3f}s")
+            print(f"Final correlation: {final_score:.4f}")
         else:
             print(f"\n⚠ Alignment may need manual adjustment.")
             print(f"Consider using different source videos or manual sync points.")
+            print(f"Final correlation score: {final_score:.4f}")
+            print(f"Note: Video alignment precision is limited to ~{precision_limit*1000:.1f}ms (frame boundaries)")
             
     except Exception as e:
         print(f"Error: {e}")

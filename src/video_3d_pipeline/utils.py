@@ -42,6 +42,21 @@ def extract_audio(video_path: str, work_dir: Path,
                  duration_seconds: float = 600, sample_rate: int = 22050) -> str:
     """ Extract audio from video for sync analysis with caching """
     
+    # Check if video has audio first
+    video_info = get_video_info(video_path)
+    if not video_info:
+        raise ValueError(f"Could not read video info for {video_path}")
+    
+    # Check for audio streams
+    try:
+        probe = ffmpeg.probe(video_path)
+        audio_streams = [stream for stream in probe['streams'] if stream['codec_type'] == 'audio']
+        if not audio_streams:
+            raise ValueError(f"No audio stream found in {video_path}")
+        print(f"Found {len(audio_streams)} audio stream(s)")
+    except Exception as e:
+        raise ValueError(f"Error checking audio streams: {e}")
+    
     # Create cache filename based on video path and parameters
     video_hash = hashlib.md5(f"{video_path}_{duration_seconds}_{sample_rate}".encode()).hexdigest()[:16]
     audio_cache_path = work_dir / f"audio_cache_{video_hash}.wav"
@@ -56,22 +71,51 @@ def extract_audio(video_path: str, work_dir: Path,
     
     print(f"Extracting audio from {video_path}...")
     
-    # Extract audio using FFmpeg
-    # Only extract first portion to save time/space
-    (
-        ffmpeg
-        .input(video_path, t=duration_seconds)
-        .output(str(audio_cache_path), 
-               acodec='pcm_s16le', 
-               ar=sample_rate, 
-               ac=1,  # mono
-               y='-')  # overwrite
-        .run(quiet=True)
-    )
+    try:
+        # Extract audio using FFmpeg with better error handling
+        (
+            ffmpeg
+            .input(video_path, t=duration_seconds)
+            .output(str(audio_cache_path), 
+                   acodec='pcm_s16le', 
+                   ar=sample_rate, 
+                   ac=1)  # mono
+            .overwrite_output()
+            .run(quiet=False, capture_stdout=True, capture_stderr=True)
+        )
+        
+    except ffmpeg.Error as e:
+        print(f"FFmpeg error details:")
+        print(f"stdout: {e.stdout.decode() if e.stdout else 'None'}")
+        print(f"stderr: {e.stderr.decode() if e.stderr else 'None'}")
+        
+        # Try alternative extraction method
+        print("Trying alternative audio extraction...")
+        try:
+            (
+                ffmpeg
+                .input(video_path)
+                .output(str(audio_cache_path), 
+                       acodec='pcm_s16le', 
+                       ar=sample_rate, 
+                       ac=1,
+                       t=duration_seconds)
+                .overwrite_output()
+                .run(quiet=False, capture_stdout=True, capture_stderr=True)
+            )
+        except ffmpeg.Error as e2:
+            print(f"Alternative method also failed:")
+            print(f"stderr: {e2.stderr.decode() if e2.stderr else 'None'}")
+            raise ValueError(f"Could not extract audio from {video_path}")
     
     if not audio_cache_path.exists():
-        raise ValueError(f"Failed to extract audio from {video_path}")
+        raise ValueError(f"Audio extraction failed - output file not created")
         
+    # Check if the output file has reasonable size
+    if audio_cache_path.stat().st_size < 1000:  # Less than 1KB
+        raise ValueError(f"Audio extraction produced unusually small file")
+        
+    print(f"Audio extracted successfully: {audio_cache_path}")
     return str(audio_cache_path)
 
 
@@ -95,12 +139,12 @@ def find_audio_offset(audio1: np.ndarray, audio2: np.ndarray, sr: int) -> Tuple[
     
     print("Computing audio cross-correlation...")
     
-    # Normalize audio to prevent overflow
-    audio1_norm = audio1 / (np.max(np.abs(audio1)) + 1e-10)
-    audio2_norm = audio2 / (np.max(np.abs(audio2)) + 1e-10)
+    # Normalize audio to zero mean and unit variance for better correlation
+    audio1_norm = (audio1 - np.mean(audio1)) / (np.std(audio1) + 1e-10)
+    audio2_norm = (audio2 - np.mean(audio2)) / (np.std(audio2) + 1e-10)
     
     # Cross-correlate the signals
-    correlation = signal.correlate(audio2_norm, audio1_norm, mode='full')
+    correlation = signal.correlate(audio2_norm, audio1_norm, mode='full', method='auto')
     
     # Find peak correlation
     max_corr_idx = np.argmax(np.abs(correlation))
@@ -110,8 +154,11 @@ def find_audio_offset(audio1: np.ndarray, audio2: np.ndarray, sr: int) -> Tuple[
     sample_offset = max_corr_idx - len(audio1) + 1
     time_offset = sample_offset / sr
     
-    # Correlation strength (normalized)
-    correlation_strength = float(np.abs(max_corr_value)) / len(audio1)
+    # Proper correlation coefficient calculation
+    # Normalize by the autocorrelation at zero lag
+    auto_corr1 = np.sum(audio1_norm * audio1_norm)
+    auto_corr2 = np.sum(audio2_norm * audio2_norm)
+    correlation_strength = float(np.abs(max_corr_value)) / np.sqrt(auto_corr1 * auto_corr2)
     
     print(f"Audio offset: {time_offset:.3f}s, correlation strength: {correlation_strength:.4f}")
     
@@ -122,7 +169,7 @@ def plot_audio_correlation(audio1: np.ndarray, audio2: np.ndarray, sr: int,
                           time_offset: float, work_dir: Path):
     """ Plot audio waveforms and correlation for visualization """
     
-    fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(12, 8))
+    fig, (ax1, ax2, ax3, ax4) = plt.subplots(4, 1, figsize=(12, 10))
     
     # Plot audio waveforms
     time1 = np.arange(len(audio1)) / sr
@@ -138,8 +185,12 @@ def plot_audio_correlation(audio1: np.ndarray, audio2: np.ndarray, sr: int,
     ax2.set_title('Audio Waveform - Video 2')
     ax2.grid(True)
     
+    # Normalize audio for correlation plot
+    audio1_norm = (audio1 - np.mean(audio1)) / (np.std(audio1) + 1e-10)
+    audio2_norm = (audio2 - np.mean(audio2)) / (np.std(audio2) + 1e-10)
+    
     # Plot correlation
-    correlation = signal.correlate(audio2, audio1, mode='full')
+    correlation = signal.correlate(audio2_norm, audio1_norm, mode='full')
     corr_time = (np.arange(len(correlation)) - len(audio1) + 1) / sr
     
     ax3.plot(corr_time, correlation)
@@ -147,9 +198,27 @@ def plot_audio_correlation(audio1: np.ndarray, audio2: np.ndarray, sr: int,
                label=f'Best offset: {time_offset:.3f}s')
     ax3.set_xlabel('Time Offset (seconds)')
     ax3.set_ylabel('Correlation')
-    ax3.set_title('Audio Cross-Correlation')
+    ax3.set_title('Audio Cross-Correlation (Normalized)')
     ax3.legend()
     ax3.grid(True)
+    
+    # Plot zoomed-in correlation around the peak
+    peak_idx = np.argmax(np.abs(correlation))
+    zoom_range = min(sr * 10, len(correlation) // 4)  # ±10 seconds or 1/4 of total
+    start_idx = max(0, peak_idx - zoom_range)
+    end_idx = min(len(correlation), peak_idx + zoom_range)
+    
+    zoom_corr = correlation[start_idx:end_idx]
+    zoom_time = corr_time[start_idx:end_idx]
+    
+    ax4.plot(zoom_time, zoom_corr)
+    ax4.axvline(time_offset, color='red', linestyle='--', 
+               label=f'Best offset: {time_offset:.3f}s')
+    ax4.set_xlabel('Time Offset (seconds)')
+    ax4.set_ylabel('Correlation')
+    ax4.set_title('Audio Cross-Correlation (Zoomed)')
+    ax4.legend()
+    ax4.grid(True)
     
     plt.tight_layout()
     plt.savefig(work_dir / 'audio_sync_analysis.png', dpi=150, bbox_inches='tight')
@@ -188,6 +257,28 @@ def verify_video_compatibility(video1_path: str, video2_path: str) -> bool:
     print(f"  Resolution: {info1['width']}x{info1['height']} vs {info2['width']}x{info2['height']}")
     
     return True
+
+
+def calculate_audio_correlation(audio1: np.ndarray, audio2: np.ndarray) -> float:
+    """ Calculate normalized correlation coefficient between two audio signals """
+    
+    # Ensure both arrays are the same length
+    min_len = min(len(audio1), len(audio2))
+    audio1_trim = audio1[:min_len]
+    audio2_trim = audio2[:min_len]
+    
+    # Normalize to zero mean and unit variance
+    audio1_norm = (audio1_trim - np.mean(audio1_trim)) / (np.std(audio1_trim) + 1e-10)
+    audio2_norm = (audio2_trim - np.mean(audio2_trim)) / (np.std(audio2_trim) + 1e-10)
+    
+    # Calculate correlation using the same method as cross-correlation
+    correlation = np.sum(audio1_norm * audio2_norm) / len(audio1_norm)
+    
+    # Handle NaN case (silent audio)
+    if np.isnan(correlation):
+        correlation = 0.0
+        
+    return float(correlation)
 
 
 def create_work_directory(base_path: str = "temp_pipeline") -> Path:
