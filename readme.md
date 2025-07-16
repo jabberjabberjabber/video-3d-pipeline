@@ -11,7 +11,6 @@ This project extracts depth information from existing 1080p stereoscopic 3D rele
 1. **Temporal Alignment** - Synchronize 1080p 3D and 4K 2D videos
 2. **Depth Extraction** - Extract disparity maps from stereoscopic frames  
 3. **Depth Upscaling** - Upscale depth maps to 4K resolution
-4. **DIBR Rendering** - Generate 4K stereoscopic output using Depth-Image-Based Rendering
 
 ## Installation
 
@@ -25,9 +24,6 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 git clone <repo-url>
 cd video-3d-pipeline
 uv sync
-
-# Install in development mode
-uv pip install -e .
 ```
 
 ## Usage
@@ -40,39 +36,13 @@ First, temporally align your 1080p 3D and 4K 2D videos using audio correlation:
 uv run video-align input_1080p_3d.mkv input_4k_2d.mp4 --duration 60
 ```
 
-This will:
-- Extract and cache audio tracks from both videos
-- Find optimal temporal alignment using audio cross-correlation
-- Generate synchronized 60-second segments  
-- Verify alignment quality using audio correlation
-- Save results in `temp_alignment/` directory
-
-**Audio-based sync advantages:**
-- 10-100x faster than video-based methods
-- Sub-second accuracy
-- Works with different resolutions/quality
-- Industry standard approach
-- Much lower CPU usage
-
 ### Step 2: Extract Depth Maps
 
 Extract depth information from the aligned 1080p 3D video using CREStereo:
 
 ```bash
-uv run video-depth-extract temp_alignment/video1_aligned_60s.mp4 --batch-size 8
+uv run video-depth-extract temp_alignment/video1_aligned_60s.mp4 --batch-size 8 --model /models/
 ```
-
-This will:
-- Split SBS frames into left/right stereo pairs
-- Process frames in GPU-accelerated batches using CREStereo
-- Generate high-quality disparity/depth maps
-- Cache results for fast reprocessing
-- Save depth maps as 16-bit PNG files
-
-**Model options:**
-- `megvii/crestereo_eth3d` (default) - Best for indoor/outdoor scenes
-- `megvii/crestereo_middlebury` - Optimized for close-range objects
-- Custom checkpoints supported
 
 **GPU requirements:**
 - CUDA-capable GPU with 6GB+ VRAM
@@ -87,26 +57,9 @@ Upscale the 1080p depth maps to 4K resolution using the 4K 2D video as guidance:
 uv run video-depth-upscale temp_depth/depth_maps_folder/ temp_alignment/video2_aligned_60s.mp4
 ```
 
-This will:
-- Load 1080p depth maps from the previous step
-- Extract corresponding 4K frames for guidance
-- Apply guided filtering for edge-preserving upscaling
-- Output 4K depth video ready for VisionDepth3D
-
-**Guided upscaling features:**
-- Edge-preserving interpolation using 4K 2D frames
-- CUDA-accelerated guided filtering
-- Maintains depth boundaries and fine details
-- Frame-synchronized with 4K 2D video
-
 ### Step 4: VisionDepth3D Integration
 
-Now you can use VisionDepth3D with superior stereo-derived depth:
-
-```bash
-# VisionDepth3D command (example)
-python vision_depth_3d.py --input temp_alignment/video2_aligned_60s.mp4 --depth temp_upscale/depth_4k_*.mp4 --output final_4k_3d.mp4
-```
+Now you can use VisionDepth3D with superior stereo-derived depth.
 
 ## Project Structure
 
