@@ -54,10 +54,35 @@ This will:
 - Industry standard approach
 - Much lower CPU usage
 
-### Step 2: Convert to 4K 3D (Coming Soon)
+### Step 2: Extract Depth Maps
+
+Extract depth information from the aligned 1080p 3D video using CREStereo:
 
 ```bash
-uv run video-3d-convert temp_alignment/video1_aligned_60s.mp4 temp_alignment/video2_aligned_60s.mp4
+uv run video-depth-extract temp_alignment/video1_aligned_60s.mp4 --batch-size 8
+```
+
+This will:
+- Split SBS frames into left/right stereo pairs
+- Process frames in GPU-accelerated batches using CREStereo
+- Generate high-quality disparity/depth maps
+- Cache results for fast reprocessing
+- Save depth maps as 16-bit PNG files
+
+**Model options:**
+- `megvii/crestereo_eth3d` (default) - Best for indoor/outdoor scenes
+- `megvii/crestereo_middlebury` - Optimized for close-range objects
+- Custom checkpoints supported
+
+**GPU requirements:**
+- CUDA-capable GPU with 6GB+ VRAM
+- Automatic batch size optimization based on available memory
+- Dynamic VRAM management to prevent overflow
+
+### Step 3: Convert to 4K 3D (Coming Soon)
+
+```bash
+uv run video-3d-convert temp_alignment/video2_aligned_60s.mp4 temp_depth/depth_maps/ --output output_4k_3d.mp4
 ```
 
 ## Project Structure
@@ -69,8 +94,11 @@ video-3d-pipeline/
 ├── src/video_3d_pipeline/
 │   ├── __init__.py            # Package initialization
 │   ├── align.py               # Video temporal alignment
+│   ├── depth.py               # Depth extraction using CREStereo
 │   ├── convert.py             # 3D conversion pipeline (WIP)
 │   └── utils.py               # Shared utilities
+├── examples/
+│   └── full_pipeline.py       # Complete workflow example
 └── tests/                     # Test suite (TBD)
 ```
 
@@ -83,6 +111,9 @@ video-3d-pipeline/
 - **NumPy** - Numerical computations
 - **Matplotlib** - Visualization and plotting
 - **scikit-image** - Image processing algorithms
+- **PyTorch** - Deep learning framework for GPU acceleration
+- **Transformers** - CREStereo model loading and inference
+- **CUDA** - GPU compute capability (optional but recommended)
 
 ## Quality Expectations
 
@@ -108,9 +139,9 @@ uv run pytest
 ## Current Status
 
 - ✅ **Audio-based Video Alignment**: Fast, accurate temporal synchronization using cross-correlation
-- 🚧 **Depth Extraction**: Stereo correspondence algorithms
-- 🚧 **Depth Upscaling**: AI-based upscaling methods  
-- 🚧 **DIBR Rendering**: 4K stereoscopic generation
+- ✅ **Depth Extraction**: GPU-accelerated stereo processing using CREStereo
+- 🚧 **Depth Upscaling**: AI-based upscaling from 1080p to 4K depth maps
+- 🚧 **DIBR Rendering**: 4K stereoscopic generation using depth-guided rendering
 
 ## Contributing
 
