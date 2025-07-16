@@ -85,3 +85,5 @@ dmypy.json
 *.7z
 crestereo_eth3d.mge
 /temp_depth
+models/crestereo_eth3d.pth
+src/video_3d_pipeline/_upscale.py
