@@ -33,6 +33,7 @@ dev = [
 [project.scripts]
 video-align = "video_3d_pipeline.align:main"
 video-depth-extract = "video_3d_pipeline.depth:main"
+video-depth-upscale = "video_3d_pipeline.upscale:main"
 video-3d-convert = "video_3d_pipeline.convert:main"
 
 [build-system]

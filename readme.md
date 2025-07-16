@@ -79,10 +79,33 @@ This will:
 - Automatic batch size optimization based on available memory
 - Dynamic VRAM management to prevent overflow
 
-### Step 3: Convert to 4K 3D (Coming Soon)
+### Step 3: Upscale Depth Maps to 4K
+
+Upscale the 1080p depth maps to 4K resolution using the 4K 2D video as guidance:
 
 ```bash
-uv run video-3d-convert temp_alignment/video2_aligned_60s.mp4 temp_depth/depth_maps/ --output output_4k_3d.mp4
+uv run video-depth-upscale temp_depth/depth_maps_folder/ temp_alignment/video2_aligned_60s.mp4
+```
+
+This will:
+- Load 1080p depth maps from the previous step
+- Extract corresponding 4K frames for guidance
+- Apply guided filtering for edge-preserving upscaling
+- Output 4K depth video ready for VisionDepth3D
+
+**Guided upscaling features:**
+- Edge-preserving interpolation using 4K 2D frames
+- CUDA-accelerated guided filtering
+- Maintains depth boundaries and fine details
+- Frame-synchronized with 4K 2D video
+
+### Step 4: VisionDepth3D Integration
+
+Now you can use VisionDepth3D with superior stereo-derived depth:
+
+```bash
+# VisionDepth3D command (example)
+python vision_depth_3d.py --input temp_alignment/video2_aligned_60s.mp4 --depth temp_upscale/depth_4k_*.mp4 --output final_4k_3d.mp4
 ```
 
 ## Project Structure
@@ -94,8 +117,9 @@ video-3d-pipeline/
 ├── src/video_3d_pipeline/
 │   ├── __init__.py            # Package initialization
 │   ├── align.py               # Video temporal alignment
-│   ├── depth.py               # Depth extraction using CREStereo
-│   ├── convert.py             # 3D conversion pipeline (WIP)
+│   ├── depth.py               # Depth extraction using hybrid stereo
+│   ├── upscale.py             # Depth upscaling with guided filtering
+│   ├── convert.py             # 3D conversion pipeline (deprecated)
 │   └── utils.py               # Shared utilities
 ├── examples/
 │   └── full_pipeline.py       # Complete workflow example
@@ -139,9 +163,9 @@ uv run pytest
 ## Current Status
 
 - ✅ **Audio-based Video Alignment**: Fast, accurate temporal synchronization using cross-correlation
-- ✅ **Depth Extraction**: GPU-accelerated stereo processing using CREStereo
-- 🚧 **Depth Upscaling**: AI-based upscaling from 1080p to 4K depth maps
-- 🚧 **DIBR Rendering**: 4K stereoscopic generation using depth-guided rendering
+- ✅ **Depth Extraction**: GPU-accelerated hybrid stereo processing with neural guidance
+- ✅ **Depth Upscaling**: Guided filtering for edge-preserving 4K depth map upscaling
+- 🔄 **VisionDepth3D Integration**: Use existing DIBR pipeline with superior stereo depth
 
 ## Contributing
 

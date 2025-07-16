@@ -84,3 +84,4 @@ htmlcov/
 dmypy.json
 *.7z
 crestereo_eth3d.mge
+/temp_depth

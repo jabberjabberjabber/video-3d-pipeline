@@ -4,14 +4,14 @@ import argparse
 from pathlib import Path
 import sys
 
-from video_3d_pipeline import VideoAligner, CREStereoDepthExtractor
+from video_3d_pipeline import VideoAligner, HybridStereoDepthExtractor, GuidedDepthUpscaler
 
 
 def run_full_pipeline(video_3d_path: str, 
                      video_4k_path: str,
                      duration: int = 60,
                      batch_size: int = 8,
-                     model_checkpoint: str = "megvii/crestereo_eth3d"):
+                     model_checkpoint: str = "Intel/dpt-large"):
     """ Run complete alignment + depth extraction pipeline """
     
     print("=== Video 3D Pipeline: Alignment + Depth Extraction ===")
@@ -57,12 +57,14 @@ def run_full_pipeline(video_3d_path: str,
     
     try:
         # Initialize depth extractor
-        depth_extractor = CREStereoDepthExtractor(
+        depth_extractor = HybridStereoDepthExtractor(
             model_checkpoint=model_checkpoint,
             work_dir="temp_depth",
             cache_dir="temp_depth",
             device="cuda",
-            batch_size=batch_size
+            batch_size=batch_size,
+            use_neural_guidance=True,
+            stereo_only=False
         )
         
         # Process the aligned 3D video to extract depth maps
@@ -81,15 +83,47 @@ def run_full_pipeline(video_3d_path: str,
         print(f"✗ Depth extraction failed: {e}")
         return False
     
+    # Step 3: Depth Upscaling
+    print("STEP 3: Depth Upscaling to 4K")
+    print("-" * 40)
+    
+    try:
+        # Initialize depth upscaler
+        upscaler = GuidedDepthUpscaler(
+            work_dir="temp_upscale",
+            cache_dir="temp_upscale",
+            device="cuda",
+            upscale_method="guided",
+            guided_filter_radius=8,
+            guided_filter_eps=0.01
+        )
+        
+        # Upscale depth maps to 4K using the 4K video as guidance
+        depth_4k_video = upscaler.process_depth_upscaling(
+            depth_dir=str(depth_output_path),
+            video_4k_path=aligned_4k,
+            output_path=None,  # Auto-generate path
+            force_reprocess=False
+        )
+        
+        print(f"✓ Depth upscaling complete!")
+        print(f"  4K depth video: {depth_4k_video}")
+        print()
+        
+    except Exception as e:
+        print(f"✗ Depth upscaling failed: {e}")
+        return False
+    
     # Summary
     print("=== Pipeline Complete ===")
     print(f"✓ Aligned videos: temp_alignment/")
     print(f"✓ Depth maps: {depth_output_path}")
+    print(f"✓ 4K depth video: {depth_4k_video}")
     print()
-    print("Next steps:")
-    print("1. Use depth maps to guide 4K→4K 3D conversion")
-    print("2. Apply DIBR rendering for final output")
-    print("3. Encode final 4K 3D video")
+    print("Ready for VisionDepth3D:")
+    print(f"1. Input 4K 2D video: {aligned_4k}")
+    print(f"2. Input 4K depth video: {depth_4k_video}")
+    print(f"3. VisionDepth3D will create 4K SBS 3D output")
     
     return True
 
@@ -103,8 +137,8 @@ def main():
                        help='Duration of segments to process (seconds)')
     parser.add_argument('--batch-size', type=int, default=8,
                        help='Batch size for depth processing (default: 8)')
-    parser.add_argument('--model', default="megvii/crestereo_eth3d",
-                       help='CREStereo model checkpoint')
+    parser.add_argument('--model', default="Intel/dpt-large",
+                       help='Neural model checkpoint (Intel/dpt-large, Intel/dpt-hybrid-midas, etc.)')
     
     args = parser.parse_args()
     

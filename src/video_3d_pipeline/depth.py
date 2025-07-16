@@ -17,30 +17,35 @@ from collections import defaultdict
 from .utils import get_video_info, create_work_directory
 
 
-class CREStereoDepthExtractor:
-    """ GPU-accelerated depth extraction from SBS video using CREStereo """
+class HybridStereoDepthExtractor:
+    """ GPU-accelerated depth extraction from SBS video using hybrid stereo matching + neural guidance """
     
     def __init__(self, 
-                 model_checkpoint: str = "megvii/crestereo_eth3d",
+                 model_checkpoint: str = "Intel/dpt-large",
                  work_dir: str = "temp_depth",
                  cache_dir: str = "temp_depth",
                  device: str = "cuda",
-                 batch_size: int = 8):
+                 batch_size: int = 8,
+                 use_neural_guidance: bool = True,
+                 stereo_only: bool = False):
         
         self.device = device
         self.work_dir = create_work_directory(work_dir)
         self.cache_dir = create_work_directory(cache_dir)
         self.batch_size = batch_size
         self.model_checkpoint = model_checkpoint
+        self.use_neural_guidance = use_neural_guidance
+        self.stereo_only = stereo_only
         
         # Verify CUDA availability
         if device == "cuda" and not torch.cuda.is_available():
             raise RuntimeError("CUDA not available but requested")
         
-        print(f"Initializing CREStereo depth extractor...")
+        print(f"Initializing Hybrid Stereo depth extractor...")
         print(f"Device: {self.device}")
-        print(f"Model: {self.model_checkpoint}")
+        print(f"Model: {self.model_checkpoint if not self.stereo_only else 'Stereo-only mode'}")
         print(f"Batch size: {self.batch_size}")
+        print(f"Neural guidance: {self.use_neural_guidance and not self.stereo_only}")
         
         # Initialize model (will be loaded on first use)
         self.model = None
@@ -51,19 +56,24 @@ class CREStereoDepthExtractor:
         self.memory_stats = defaultdict(float)
     
     def load_model(self):
-        """ Load CREStereo model to GPU """
+        """ Load depth estimation model to GPU """
         if self.model_loaded:
             return
         
-        print(f"Loading CREStereo model: {self.model_checkpoint}")
+        if self.stereo_only:
+            print("Using stereo-only mode (no neural network)")
+            self.model_loaded = True
+            return
+        
+        print(f"Loading depth model: {self.model_checkpoint}")
         
         try:
-            # Import here to avoid dependency issues if not installed
-            from transformers import AutoImageProcessor, AutoModel
+            # Use DPT for monocular depth estimation as guidance
+            from transformers import DPTImageProcessor, DPTForDepthEstimation
             
-            # Load processor and model
-            self.processor = AutoImageProcessor.from_pretrained(self.model_checkpoint)
-            self.model = AutoModel.from_pretrained(self.model_checkpoint)
+            print("Loading DPT model for neural depth guidance")
+            self.processor = DPTImageProcessor.from_pretrained(self.model_checkpoint)
+            self.model = DPTForDepthEstimation.from_pretrained(self.model_checkpoint)
             
             # Move to GPU
             if self.device == "cuda":
@@ -93,9 +103,13 @@ class CREStereoDepthExtractor:
             print("✓ Model loaded successfully")
             
         except ImportError:
-            raise ImportError("transformers library required for CREStereo. Install with: pip install transformers")
+            print("Warning: transformers library not available, falling back to stereo-only mode")
+            self.stereo_only = True
+            self.model_loaded = True
         except Exception as e:
-            raise RuntimeError(f"Failed to load CREStereo model: {e}")
+            print(f"Warning: Failed to load neural model, falling back to stereo-only mode: {e}")
+            self.stereo_only = True
+            self.model_loaded = True
     
     def get_cache_path(self, video_path: str, frame_start: int, frame_count: int) -> Path:
         """ Generate cache path for depth maps """
@@ -122,7 +136,55 @@ class CREStereoDepthExtractor:
             return True
         
         return False
-    
+
+    def extract_frames_opencv(self, video_path: str, start_frame: int = 0, max_frames: int = None) -> List[np.ndarray]:
+        """ Extract video frames using OpenCV """
+        print(f"Extracting frames from {video_path} using OpenCV...")
+
+        # Get video info
+        video_info = get_video_info(video_path)
+        if not video_info:
+            raise ValueError(f"Could not read video info: {video_path}")
+
+        total_frames = video_info.get('frames', 0) or int(video_info['duration'] * video_info['fps'])
+
+        if max_frames is None:
+            max_frames = total_frames - start_frame
+        else:
+            max_frames = min(max_frames, total_frames - start_frame)
+
+        print(f"Extracting {max_frames} frames starting from frame {start_frame}")
+
+        frames = []
+
+        try:
+            cap = cv2.VideoCapture(video_path)
+            if not cap.isOpened():
+                raise ValueError(f"Could not open video file: {video_path}")
+
+            # Set start frame
+            cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+
+            frame_count = 0
+            while frame_count < max_frames:
+                ret, frame = cap.read()
+                if not ret:
+                    break
+
+                frames.append(frame)
+                frame_count += 1
+
+                if frame_count % 100 == 0:
+                    print(f"Extracted {frame_count}/{max_frames} frames...")
+
+            cap.release()
+
+        except Exception as e:
+            raise RuntimeError(f"Frame extraction failed: {e}")
+
+        print(f"✓ Extracted {len(frames)} frames")
+        return frames
+        
     def extract_frames_ffmpeg(self, video_path: str, start_frame: int = 0, max_frames: int = None) -> List[np.ndarray]:
         """ Extract video frames using ffmpeg """
         print(f"Extracting frames from {video_path}...")
@@ -197,29 +259,34 @@ class CREStereoDepthExtractor:
         return left_frame, right_frame
     
     def preprocess_frame_pair(self, left_frame: np.ndarray, right_frame: np.ndarray) -> Dict:
-        """ Preprocess frame pair for CREStereo """
+        """ Preprocess frame pair for depth estimation """
         # Convert BGR to RGB if needed (OpenCV default is BGR)
         if left_frame.shape[2] == 3:
-            left_rgb = cv2.cvtColor(left_frame, cv2.COLOR_BGR2RGB) if len(left_frame.shape) == 3 else left_frame
-            right_rgb = cv2.cvtColor(right_frame, cv2.COLOR_BGR2RGB) if len(right_frame.shape) == 3 else right_frame
+            left_rgb = cv2.cvtColor(left_frame, cv2.COLOR_BGR2RGB)
+            right_rgb = cv2.cvtColor(right_frame, cv2.COLOR_BGR2RGB)
         else:
             left_rgb = left_frame
             right_rgb = right_frame
         
-        # Process images using the model's processor
-        inputs = self.processor(
-            images=[left_rgb, right_rgb],
-            return_tensors="pt"
-        )
+        result = {'stereo_pair': {'left': left_rgb, 'right': right_rgb}}
         
-        # Move to device
-        if self.device == "cuda":
-            inputs = {k: v.to(self.device) for k, v in inputs.items()}
+        # Only process for neural guidance if needed
+        if self.use_neural_guidance and not self.stereo_only and hasattr(self, 'processor'):
+            try:
+                inputs = self.processor(images=left_rgb, return_tensors="pt")
+                
+                # Move to device
+                if self.device == "cuda":
+                    inputs = {k: v.to(self.device) for k, v in inputs.items()}
+                
+                result['dpt_inputs'] = inputs
+            except Exception as e:
+                print(f"Warning: Neural preprocessing failed: {e}")
         
-        return inputs
+        return result
     
     def process_frame_batch(self, frame_pairs: List[Tuple[np.ndarray, np.ndarray]]) -> List[np.ndarray]:
-        """ Process batch of frame pairs through CREStereo """
+        """ Process batch of frame pairs for depth estimation """
         if not self.model_loaded:
             self.load_model()
         
@@ -235,34 +302,69 @@ class CREStereoDepthExtractor:
         depth_maps = []
         
         try:
+            # Create stereo matcher for traditional stereo matching
+            stereo = cv2.StereoSGBM_create(
+                minDisparity=0,
+                numDisparities=64,  # Must be divisible by 16
+                blockSize=5,
+                P1=8 * 3 * 5**2,
+                P2=32 * 3 * 5**2,
+                disp12MaxDiff=1,
+                uniquenessRatio=10,
+                speckleWindowSize=100,
+                speckleRange=32
+            )
+            
             with torch.no_grad():
-                # Preprocess all frame pairs
-                batch_inputs = []
-                for left, right in frame_pairs:
-                    inputs = self.preprocess_frame_pair(left, right)
-                    batch_inputs.append(inputs)
-                
-                # Process each pair (CREStereo typically processes one pair at a time)
-                for i, inputs in enumerate(batch_inputs):
+                # Process each pair
+                for i, (left, right) in enumerate(frame_pairs):
                     print(f"  Processing pair {i+1}/{batch_size}...")
                     
-                    # Run inference
-                    outputs = self.model(**inputs)
+                    # Preprocess frames
+                    processed = self.preprocess_frame_pair(left, right)
+                    stereo_pair = processed['stereo_pair']
                     
-                    # Extract disparity map
-                    disparity = outputs.disparity[0]  # Remove batch dimension
+                    # Convert to grayscale for stereo matching
+                    left_gray = cv2.cvtColor(stereo_pair['left'], cv2.COLOR_RGB2GRAY)
+                    right_gray = cv2.cvtColor(stereo_pair['right'], cv2.COLOR_RGB2GRAY)
                     
-                    # Convert to numpy
-                    if isinstance(disparity, torch.Tensor):
-                        disparity_np = disparity.cpu().numpy()
+                    # Compute disparity using stereo matching
+                    disparity = stereo.compute(left_gray, right_gray).astype(np.float32) / 16.0
+                    
+                    # Optional: Use neural guidance if enabled and available
+                    if (self.use_neural_guidance and not self.stereo_only and 
+                        hasattr(self, 'model') and 'dpt_inputs' in processed):
+                        try:
+                            dpt_inputs = processed['dpt_inputs']
+                            dpt_outputs = self.model(**dpt_inputs)
+                            monocular_depth = dpt_outputs.predicted_depth[0].cpu().numpy()
+                            
+                            # Resize monocular depth to match disparity
+                            if monocular_depth.shape != disparity.shape:
+                                monocular_depth = cv2.resize(monocular_depth, 
+                                                            (disparity.shape[1], disparity.shape[0]))
+                            
+                            # Combine stereo disparity with monocular depth (weighted average)
+                            # Normalize monocular depth to disparity range
+                            if monocular_depth.max() > monocular_depth.min():
+                                mono_normalized = ((monocular_depth - monocular_depth.min()) / 
+                                                 (monocular_depth.max() - monocular_depth.min()) * 64)
+                                
+                                # Weighted combination (favor stereo for accuracy)
+                                combined_disparity = 0.7 * disparity + 0.3 * mono_normalized
+                            else:
+                                combined_disparity = disparity
+                                
+                        except Exception as e:
+                            print(f"    Warning: Neural guidance failed, using stereo only: {e}")
+                            combined_disparity = disparity
                     else:
-                        disparity_np = disparity
+                        combined_disparity = disparity
                     
-                    # Ensure proper shape and type
-                    if len(disparity_np.shape) > 2:
-                        disparity_np = disparity_np.squeeze()
+                    # Clean up disparity (remove invalid values)
+                    combined_disparity[combined_disparity <= 0] = 0
                     
-                    depth_maps.append(disparity_np.astype(np.float32))
+                    depth_maps.append(combined_disparity.astype(np.float32))
                 
         except torch.cuda.OutOfMemoryError as e:
             print(f"GPU memory error in batch processing: {e}")
@@ -326,7 +428,7 @@ class CREStereoDepthExtractor:
             return cache_path
         
         # Extract frames
-        frames = self.extract_frames_ffmpeg(video_path, start_frame, frame_count)
+        frames = self.extract_frames_opencv(video_path, start_frame, frame_count)
         
         if not frames:
             raise ValueError("No frames extracted from video")
@@ -375,25 +477,35 @@ def main():
                        help='Maximum number of frames to process (default: all)')
     parser.add_argument('--batch-size', type=int, default=8,
                        help='Batch size for GPU processing (default: 8)')
-    parser.add_argument('--model', default="megvii/crestereo_eth3d",
-                       help='CREStereo model checkpoint (default: megvii/crestereo_eth3d)')
+    parser.add_argument('--model', default="Intel/dpt-large",
+                       help='Neural model checkpoint (default: Intel/dpt-large)')
     parser.add_argument('--work-dir', default='temp_depth',
                        help='Working directory for output (default: temp_depth)')
     parser.add_argument('--force', action='store_true',
                        help='Force reprocessing even if cached results exist')
     parser.add_argument('--device', default='cuda',
                        help='Processing device (default: cuda)')
+    parser.add_argument('--stereo-only', action='store_true',
+                       help='Use stereo matching only (no neural guidance)')
+    parser.add_argument('--no-neural', action='store_true',
+                       help='Disable neural guidance (same as --stereo-only)')
     
     args = parser.parse_args()
     
+    # Handle neural guidance flags
+    stereo_only = args.stereo_only or args.no_neural
+    use_neural_guidance = not stereo_only
+    
     try:
         # Initialize depth extractor
-        extractor = CREStereoDepthExtractor(
+        extractor = HybridStereoDepthExtractor(
             model_checkpoint=args.model,
             work_dir=args.work_dir,
             cache_dir=args.work_dir,
             device=args.device,
-            batch_size=args.batch_size
+            batch_size=args.batch_size,
+            use_neural_guidance=use_neural_guidance,
+            stereo_only=stereo_only
         )
         
         # Process video
