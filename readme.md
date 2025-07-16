@@ -33,7 +33,7 @@ uv sync
 First, temporally align your 1080p 3D and 4K 2D videos using audio correlation:
 
 ```bash
-uv run video-align input_1080p_3d.mkv input_4k_2d.mp4 --duration 60
+uv run video-align input_1080p_3d.mp4 input_4k_2d.mp4
 ```
 
 ### Step 2: Extract Depth Maps
@@ -41,20 +41,18 @@ uv run video-align input_1080p_3d.mkv input_4k_2d.mp4 --duration 60
 Extract depth information from the aligned 1080p 3D video using CREStereo:
 
 ```bash
-uv run video-depth-extract temp_alignment/video1_aligned_60s.mp4 --batch-size 8 --model /models/
+uv run video-depth-extract temp_alignment/input_1080p_3d_aligned.mp4 --model crestereo_eth3d.pth
 ```
 
 **GPU requirements:**
-- CUDA-capable GPU with 6GB+ VRAM
-- Automatic batch size optimization based on available memory
-- Dynamic VRAM management to prevent overflow
+- CUDA-capable GPU with 4GB+ VRAM
 
-### Step 3: Upscale Depth Maps to 4K
+### Step 3: Upscale Depth Maps to 4K and Create
 
-Upscale the 1080p depth maps to 4K resolution using the 4K 2D video as guidance:
+Create a video of the depth map for use with VisionDepth3D and the 4K video:
 
 ```bash
-uv run video-depth-upscale temp_depth/depth_maps_folder/ temp_alignment/video2_aligned_60s.mp4
+uv run video-depth-upscale temp_depth/depth_maps_folder/ temp_alignment/input_4k_2d_aligned.mp4
 ```
 
 ### Step 4: VisionDepth3D Integration
