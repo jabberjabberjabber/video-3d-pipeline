@@ -27,7 +27,8 @@ class HybridStereoDepthExtractor:
                  device: str = "cuda",
                  batch_size: int = 8,
                  use_neural_guidance: bool = True,
-                 stereo_only: bool = False):
+                 stereo_only: bool = False,
+                 unsqueeze_sbs: bool = True):
         
         self.device = device
         self.work_dir = create_work_directory(work_dir)
@@ -36,6 +37,7 @@ class HybridStereoDepthExtractor:
         self.model_checkpoint = model_checkpoint
         self.use_neural_guidance = use_neural_guidance
         self.stereo_only = stereo_only
+        self.unsqueeze_sbs = unsqueeze_sbs
         
         # Verify CUDA availability
         if device == "cuda" and not torch.cuda.is_available():
@@ -114,7 +116,7 @@ class HybridStereoDepthExtractor:
     def get_cache_path(self, video_path: str, frame_start: int, frame_count: int) -> Path:
         """ Generate cache path for depth maps """
         # Create cache key from video path and frame range
-        cache_key = f"{video_path}_{frame_start}_{frame_count}_{self.model_checkpoint}"
+        cache_key = f"{video_path}_{frame_start}_{frame_count}_{self.model_checkpoint}_{self.unsqueeze_sbs}"
         cache_hash = hashlib.md5(cache_key.encode()).hexdigest()[:16]
         
         cache_subdir = self.cache_dir / f"depth_{cache_hash}"
@@ -245,7 +247,7 @@ class HybridStereoDepthExtractor:
         print(f"✓ Extracted {len(frames)} frames")
         return frames
     
-    def split_sbs_frame(self, sbs_frame: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    def split_sbs_frame(self, sbs_frame: np.ndarray, unsqueeze: bool = True) -> Tuple[np.ndarray, np.ndarray]:
         """ Split side-by-side frame into left and right images """
         height, width = sbs_frame.shape[:2]
         
@@ -255,6 +257,13 @@ class HybridStereoDepthExtractor:
         half_width = width // 2
         left_frame = sbs_frame[:, :half_width]
         right_frame = sbs_frame[:, half_width:]
+        
+        # Unsqueeze horizontally to restore proper aspect ratio
+        # SBS typically compresses each eye horizontally by 50%
+        if unsqueeze:
+            target_width = half_width * 2  # Restore original width
+            left_frame = cv2.resize(left_frame, (target_width, height), interpolation=cv2.INTER_LANCZOS4)
+            right_frame = cv2.resize(right_frame, (target_width, height), interpolation=cv2.INTER_LANCZOS4)
         
         return left_frame, right_frame
     
@@ -445,7 +454,7 @@ class HybridStereoDepthExtractor:
             # Split SBS frames into left/right pairs
             frame_pairs = []
             for frame in batch_frames:
-                left, right = self.split_sbs_frame(frame)
+                left, right = self.split_sbs_frame(frame, unsqueeze=self.unsqueeze_sbs)
                 frame_pairs.append((left, right))
             
             # Process batch
@@ -489,12 +498,15 @@ def main():
                        help='Use stereo matching only (no neural guidance)')
     parser.add_argument('--no-neural', action='store_true',
                        help='Disable neural guidance (same as --stereo-only)')
+    parser.add_argument('--no-unsqueeze', action='store_true',
+                       help='Skip SBS unsqueezing (keep squeezed aspect ratio)')
     
     args = parser.parse_args()
     
     # Handle neural guidance flags
     stereo_only = args.stereo_only or args.no_neural
     use_neural_guidance = not stereo_only
+    unsqueeze_sbs = not args.no_unsqueeze
     
     try:
         # Initialize depth extractor
@@ -505,7 +517,8 @@ def main():
             device=args.device,
             batch_size=args.batch_size,
             use_neural_guidance=use_neural_guidance,
-            stereo_only=stereo_only
+            stereo_only=stereo_only,
+            unsqueeze_sbs=unsqueeze_sbs
         )
         
         # Process video

@@ -11,6 +11,7 @@ This project extracts depth information from existing 1080p stereoscopic 3D rele
 1. **Temporal Alignment** - Synchronize 1080p 3D and 4K 2D videos
 2. **Depth Extraction** - Extract disparity maps from stereoscopic frames  
 3. **Depth Upscaling** - Upscale depth maps to 4K resolution
+4. **3D Video Creation with VisionDepth3D** - Add created depth map along with 4K video to create a native 4K 3D video
 
 ## Installation
 
@@ -28,31 +29,32 @@ uv sync
 
 ## Usage
 
-### Step 1: Align Videos
-
-First, temporally align your 1080p 3D and 4K 2D videos using audio correlation:
-
+### Fast Method (Recommended):
 ```bash
-uv run video-align input_1080p_3d.mp4 input_4k_2d.mp4
+# 1. Quick alignment (seconds)
+uv run python -m video_3d_pipeline.align_fast sbs_1080p.mp4 video_4k.mp4
+
+# 2. Depth extraction with aspect fix
+uv run python -m video_3d_pipeline.depth sbs_1080p.mp4
+
+# 3. Upscale to 4K
+uv run python -m video_3d_pipeline.upscale temp_depth/depth_maps/ video_4k.mp4
+
+# 4. Use with VisionDepth3D
+# - 4K video: video_4k.mp4
+# - 4K depth: depth_4k_depth_*.mp4
 ```
 
-### Step 2: Extract Depth Maps
-
-Extract depth information from the aligned 1080p 3D video using CREStereo:
-
+### One-Command Pipeline:
 ```bash
-uv run video-depth-extract temp_alignment/input_1080p_3d_aligned.mp4 --model crestereo_eth3d.pth
-```
+# Complete pipeline
+uv run python run_pipeline.py sbs_1080p.mp4 video_4k.mp4
 
-**GPU requirements:**
-- CUDA-capable GPU with 4GB+ VRAM
+# Test with limited frames
+uv run python run_pipeline.py sbs_1080p.mp4 video_4k.mp4 --max-frames 100
 
-### Step 3: Upscale Depth Maps to 4K and Create
-
-Create a video of the depth map for use with VisionDepth3D and the 4K video:
-
-```bash
-uv run video-depth-upscale temp_depth/depth_maps_folder/ temp_alignment/input_4k_2d_aligned.mp4
+# Skip steps as needed
+uv run python run_pipeline.py sbs_1080p.mp4 video_4k.mp4 --skip-alignment
 ```
 
 ### Step 4: VisionDepth3D Integration
@@ -63,18 +65,15 @@ Now you can use VisionDepth3D with superior stereo-derived depth.
 
 ```
 video-3d-pipeline/
-├── pyproject.toml              # UV project configuration
-├── README.md                   # This file
+├── pyproject.toml             # UV project configuration
+├── README.md                  # This file
 ├── src/video_3d_pipeline/
 │   ├── __init__.py            # Package initialization
-│   ├── align.py               # Video temporal alignment
+│   ├── align_fast.py          # Video temporal alignment
 │   ├── depth.py               # Depth extraction using hybrid stereo
 │   ├── upscale.py             # Depth upscaling with guided filtering
-│   ├── convert.py             # 3D conversion pipeline (deprecated)
 │   └── utils.py               # Shared utilities
-├── examples/
-│   └── full_pipeline.py       # Complete workflow example
-└── tests/                     # Test suite (TBD)
+└── run_pipeline.py            # Main tool
 ```
 
 ## Dependencies
@@ -89,27 +88,6 @@ video-3d-pipeline/
 - **PyTorch** - Deep learning framework for GPU acceleration
 - **Transformers** - CREStereo model loading and inference
 - **CUDA** - GPU compute capability (optional but recommended)
-
-## Quality Expectations
-
-- **Audio correlation >0.8**: Excellent temporal sync
-- **Audio correlation 0.6-0.8**: Good sync, suitable for processing  
-- **Audio correlation <0.6**: May need manual adjustment or different source videos
-- **Video compatibility check**: Verifies duration and frame rate compatibility
-
-## Development
-
-```bash
-# Install development dependencies
-uv sync --extra dev
-
-# Run linting
-uv run ruff check src/
-uv run black src/
-
-# Run tests (when implemented)
-uv run pytest
-```
 
 ## Current Status
 

@@ -259,6 +259,14 @@ def verify_video_compatibility(video1_path: str, video2_path: str) -> bool:
     return True
 
 
+def load_alignment_data(alignment_file: str) -> dict:
+    """ Load alignment data from JSON file """
+    import json
+    
+    with open(alignment_file, 'r') as f:
+        return json.load(f)
+
+
 def calculate_audio_correlation(audio1: np.ndarray, audio2: np.ndarray) -> float:
     """ Calculate normalized correlation coefficient between two audio signals """
     
@@ -286,3 +294,34 @@ def create_work_directory(base_path: str = "temp_pipeline") -> Path:
     work_dir = Path(base_path)
     work_dir.mkdir(exist_ok=True)
     return work_dir
+
+
+def apply_alignment_offset(alignment_file: str, target_video_path: str, 
+                          base_start_time: float = 0) -> float:
+    """ Apply stored alignment offset to get adjusted start time for video processing """
+    import json
+    
+    # Load alignment data
+    with open(alignment_file, 'r') as f:
+        alignment_data = json.load(f)
+    
+    offset = alignment_data['time_offset_seconds']
+    video1_path = alignment_data['video1_path']
+    video2_path = alignment_data['video2_path']
+    
+    # Determine which video and apply appropriate offset
+    if str(target_video_path) == video1_path:
+        # Video1 is reference, no offset needed
+        adjusted_start = base_start_time
+    elif str(target_video_path) == video2_path:
+        # Video2 needs offset applied
+        adjusted_start = base_start_time + offset
+    else:
+        raise ValueError(f"Video {target_video_path} not found in alignment data")
+    
+    # Ensure non-negative start time
+    if adjusted_start < 0:
+        print(f"Warning: Adjusted start time {adjusted_start:.3f}s < 0, using 0")
+        adjusted_start = 0
+    
+    return adjusted_start
