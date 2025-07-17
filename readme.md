@@ -34,7 +34,7 @@ This project extracts depth information from existing 1080p stereoscopic 3D rele
 1. **Temporal Alignment** - Synchronize 1080p 3D and 4K 2D videos
 2. **Depth Extraction** - Extract disparity maps from stereoscopic frames  
 3. **Depth Upscaling** - Upscale depth maps to 4K resolution using IGEV
-4. **3D Video Creation with VisionDepth3D** - Add created depth map along with 4K video to create a native 4K 3D video
+4. **3D Video Creation** - Add created depth map along with 4K video to create a native 4K 3D video
 
 ## Installation
 
@@ -98,7 +98,6 @@ video-3d-pipeline/
 │   ├── upscale.py             	# Depth upscaling with guided filtering
 │   └── utils.py               	# Shared utilities
 ├── models/						# Pretrained models
-├── IGEV/						# IGEV
 ├── unimatch/					# unimatch 
 └── run_pipeline.py            	# Main tool
 ```
@@ -114,14 +113,14 @@ video-3d-pipeline/
 - **scikit-image** - Image processing algorithms
 - **PyTorch** - Deep learning framework for GPU acceleration
 - **Transformers** - 
-- **CUDA** - GPU compute capability (optional but recommended)
+- **CUDA** - 
 
 ## Current Status
 
 - ✅ **Audio-based Video Alignment**: Fast, accurate temporal synchronization using cross-correlation
 - ✅ **Depth Extraction**: GPU-accelerated hybrid stereo processing with neural guidance
 - ✅ **Depth Upscaling**: Guided filtering for edge-preserving 4K depth map upscaling
-- 🔄 **VisionDepth3D Integration**: Use existing DIBR pipeline with superior stereo depth
+- 🔄 **DIBR**: Use DIBR to achieve with stereo depth
 
 ## Contributing
 

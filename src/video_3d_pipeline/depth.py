@@ -144,23 +144,12 @@ class IGEVStereoDepthExtractor:
         return cache_subdir
     
     def is_cached(self, cache_path: Path, frame_count: int) -> bool:
-        """ Check if depth maps are already cached """
-        if not cache_path.exists():
-            return False
-        
-        # Check if all expected depth maps exist
-        expected_files = [cache_path / f"depth_{i:06d}.png" for i in range(frame_count)]
-        all_exist = all(f.exists() for f in expected_files)
-        
-        if all_exist:
-            print(f"✓ Found cached depth maps: {cache_path}")
-            return True
-        
-        return False
+        """ Check if depth video is already cached (legacy method for compatibility) """
+        return self.is_video_cached(cache_path)
 
-    def extract_frames_opencv(self, video_path: str, start_frame: int = 0, max_frames: int = None) -> List[np.ndarray]:
-        """ Extract video frames using OpenCV """
-        print(f"Extracting frames from {video_path} using OpenCV...")
+    def get_frame_generator(self, video_path: str, start_frame: int = 0, max_frames: int = None):
+        """ Generator that yields frames one at a time to avoid memory issues """
+        print(f"Setting up frame generator for {video_path}...")
 
         # Get video info
         video_info = get_video_info(video_path)
@@ -174,9 +163,7 @@ class IGEVStereoDepthExtractor:
         else:
             max_frames = min(max_frames, total_frames - start_frame)
 
-        print(f"Extracting {max_frames} frames starting from frame {start_frame}")
-
-        frames = []
+        print(f"Will process {max_frames} frames starting from frame {start_frame}")
 
         try:
             cap = cv2.VideoCapture(video_path)
@@ -192,19 +179,18 @@ class IGEVStereoDepthExtractor:
                 if not ret:
                     break
 
-                frames.append(frame)
+                yield frame, frame_count
                 frame_count += 1
 
                 if frame_count % 100 == 0:
-                    print(f"Extracted {frame_count}/{max_frames} frames...")
+                    print(f"Processed {frame_count}/{max_frames} frames...")
 
             cap.release()
+            print(f"✓ Completed processing {frame_count} frames")
 
         except Exception as e:
+            cap.release()
             raise RuntimeError(f"Frame extraction failed: {e}")
-
-        print(f"✓ Extracted {len(frames)} frames")
-        return frames
         
     def split_sbs_frame(self, sbs_frame: np.ndarray, unsqueeze: bool = True) -> Tuple[np.ndarray, np.ndarray]:
         """ Split side-by-side frame into left and right images """
@@ -285,23 +271,47 @@ class IGEVStereoDepthExtractor:
         
         return depth_maps
     
-    def save_depth_map(self, depth_map: np.ndarray, output_path: Path):
-        """ Save depth map as 16-bit PNG """
-        # Convert to 16-bit for saving
-        depth_16bit = np.round(depth_map * 65535).astype(np.uint16)
+    def create_depth_video_writer(self, cache_path: Path, video_info: dict, output_height: int, output_width: int):
+        """ Create FFmpeg video writer for depth maps """
+        output_video_path = cache_path / "depth_video.mp4"
         
-        # Ensure output directory exists
-        output_path.parent.mkdir(parents=True, exist_ok=True)
+        # Use efficient encoding for depth data
+        writer = (
+            ffmpeg
+            .input('pipe:', format='rawvideo', pix_fmt='gray16le', 
+                   s=f"{output_width}x{output_height}", 
+                   r=video_info['fps'])
+            .output(str(output_video_path), 
+                   vcodec='libx265',  # H.265 for better compression
+                   crf=18,  # High quality, good compression
+                   pix_fmt='yuv420p10le',  # 10-bit for depth precision
+                   preset='fast')  # Reasonable encoding speed
+            .overwrite_output()
+            .run_async(pipe_stdin=True)
+        )
         
-        # Save using skimage
-        skimage.io.imsave(str(output_path), depth_16bit)
+        return writer, output_video_path
+    
+    def write_depth_to_video(self, depth_maps: List[np.ndarray], video_writer):
+        """ Write batch of depth maps directly to video stream """
+        for depth_map in depth_maps:
+            # Convert to 16-bit for video encoding
+            depth_16bit = np.round(depth_map * 65535).astype(np.uint16)
+            
+            # Write raw bytes to ffmpeg pipe
+            video_writer.stdin.write(depth_16bit.tobytes())
+    
+    def is_video_cached(self, cache_path: Path) -> bool:
+        """ Check if depth video is already cached """
+        video_path = cache_path / "depth_video.mp4"
+        return video_path.exists() and video_path.stat().st_size > 1000  # More than 1KB
     
     def process_video_sbs(self, 
                          video_path: str, 
                          start_frame: int = 0, 
                          max_frames: int = None,
                          force_reprocess: bool = False) -> Path:
-        """ Process entire SBS video to extract depth maps """
+        """ Process entire SBS video to extract depth maps using streaming to video """
         
         print(f"Processing SBS video: {video_path}")
         
@@ -320,51 +330,101 @@ class IGEVStereoDepthExtractor:
         print(f"Video info: {video_info['width']}x{video_info['height']} @ {video_info['fps']:.1f}fps")
         print(f"Processing {frame_count} frames starting from frame {start_frame}")
         
+        # Calculate output dimensions
+        half_width = video_info['width'] // 2
+        output_width = half_width * (2 if self.unsqueeze_sbs else 1)
+        output_height = video_info['height']
+        
+        print(f"Output depth dimensions: {output_width}x{output_height}")
+        
         # Check cache
         cache_path = self.get_cache_path(video_path, start_frame, frame_count)
         
-        if not force_reprocess and self.is_cached(cache_path, frame_count):
-            print("✓ Using cached depth maps")
-            return cache_path
+        if not force_reprocess and self.is_video_cached(cache_path):
+            print("✓ Using cached depth video")
+            return cache_path / "depth_video.mp4"
         
-        # Extract frames
-        frames = self.extract_frames_opencv(video_path, start_frame, frame_count)
+        # Set up video writer for streaming depth maps
+        video_writer = None
+        output_video_path = None
         
-        if not frames:
-            raise ValueError("No frames extracted from video")
+        try:
+            # Process frames in streaming batches to avoid memory issues
+            processed_count = 0
+            batch_frames = []
+            batch_indices = []
+            batch_num = 1
+            
+            # Get frame generator to avoid loading all frames into memory
+            frame_generator = self.get_frame_generator(video_path, start_frame, frame_count)
+            
+            for frame, frame_idx in frame_generator:
+                batch_frames.append(frame)
+                batch_indices.append(frame_idx)
+                
+                # Process batch when it reaches the batch size or at the end
+                if len(batch_frames) >= self.batch_size or frame_idx == frame_count - 1:
+                    print(f"Processing batch {batch_num}: frames {batch_indices[0]}-{batch_indices[-1]}")
+                    
+                    # Initialize video writer on first batch
+                    if video_writer is None:
+                        video_writer, output_video_path = self.create_depth_video_writer(
+                            cache_path, video_info, output_height, output_width
+                        )
+                        print(f"Started depth video encoding: {output_video_path}")
+                    
+                    # Split SBS frames into left/right pairs
+                    frame_pairs = []
+                    for frame in batch_frames:
+                        left, right = self.split_sbs_frame(frame, unsqueeze=self.unsqueeze_sbs)
+                        frame_pairs.append((left, right))
+                    
+                    # Process batch
+                    depth_maps = self.process_frame_batch(frame_pairs)
+                    
+                    # Write depth maps directly to video stream
+                    self.write_depth_to_video(depth_maps, video_writer)
+                    processed_count += len(depth_maps)
+                    
+                    print(f"✓ Streamed batch to video ({processed_count}/{frame_count} total)")
+                    
+                    # Clear batch for next iteration
+                    batch_frames = []
+                    batch_indices = []
+                    batch_num += 1
+                    
+                    # Force garbage collection to free memory
+                    gc.collect()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+            
+            # Close video writer
+            if video_writer:
+                video_writer.stdin.close()
+                video_writer.wait()
+                
+                # Verify output file was created successfully
+                if output_video_path and output_video_path.exists():
+                    file_size_mb = output_video_path.stat().st_size / (1024 * 1024)
+                    print(f"✓ Depth video created: {output_video_path} ({file_size_mb:.1f}MB)")
+                else:
+                    raise RuntimeError("Video encoding failed - output file not created")
         
-        # Process frames in batches
-        processed_count = 0
+        except Exception as e:
+            # Clean up video writer on error
+            if video_writer:
+                try:
+                    video_writer.stdin.close()
+                    video_writer.wait()
+                except:
+                    pass
+            raise e
         
-        for batch_start in range(0, len(frames), self.batch_size):
-            batch_end = min(batch_start + self.batch_size, len(frames))
-            batch_frames = frames[batch_start:batch_end]
-            
-            print(f"Processing batch {batch_start//self.batch_size + 1}: frames {batch_start}-{batch_end-1}")
-            
-            # Split SBS frames into left/right pairs
-            frame_pairs = []
-            for frame in batch_frames:
-                left, right = self.split_sbs_frame(frame, unsqueeze=self.unsqueeze_sbs)
-                frame_pairs.append((left, right))
-            
-            # Process batch
-            depth_maps = self.process_frame_batch(frame_pairs)
-            
-            # Save depth maps
-            for i, depth_map in enumerate(depth_maps):
-                frame_idx = batch_start + i
-                output_path = cache_path / f"depth_{frame_idx:06d}.png"
-                self.save_depth_map(depth_map, output_path)
-                processed_count += 1
-            
-            print(f"✓ Saved batch depth maps ({processed_count}/{len(frames)} total)")
-        
-        print(f"✓ Depth extraction complete: {cache_path}")
+        print(f"✓ Depth extraction complete: {output_video_path}")
         print(f"  Processed {processed_count} frames")
-        print(f"  Output directory: {cache_path}")
+        print(f"  Output: {output_video_path}")
         
-        return cache_path
+        return output_video_path
 
 
 def main():
