@@ -9,8 +9,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent / 'src'))
 
 from video_3d_pipeline.align import VideoAligner
-from video_3d_pipeline.depth import IGEVStereoDepthExtractor  
 from video_3d_pipeline.upscale import SimpleDepthUpscaler
+from video_3d_pipeline.unimatch_depth import UniMatchStereoDepthExtractor
 
 
 def run_pipeline(sbs_video: str, 
@@ -60,7 +60,16 @@ def run_pipeline(sbs_video: str,
         print("\n--- Step 2: Depth Extraction ---")
         step_start = time.time()
         
+        '''
         extractor = IGEVStereoDepthExtractor(
+            work_dir=work_dir,
+            cache_dir=work_dir,
+            unsqueeze_sbs=True,  # Fix SBS aspect ratio
+            batch_size=8
+        )
+        '''
+        
+        extractor = UniMatchStereoDepthExtractor(
             work_dir=work_dir,
             cache_dir=work_dir,
             unsqueeze_sbs=True,  # Fix SBS aspect ratio

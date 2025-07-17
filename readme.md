@@ -33,7 +33,7 @@ This project extracts depth information from existing 1080p stereoscopic 3D rele
 
 1. **Temporal Alignment** - Synchronize 1080p 3D and 4K 2D videos
 2. **Depth Extraction** - Extract disparity maps from stereoscopic frames  
-3. **Depth Upscaling** - Upscale depth maps to 4K resolution
+3. **Depth Upscaling** - Upscale depth maps to 4K resolution using IGEV
 4. **3D Video Creation with VisionDepth3D** - Add created depth map along with 4K video to create a native 4K 3D video
 
 ## Installation
@@ -69,6 +69,7 @@ uv run python -m video_3d_pipeline.upscale temp_depth/depth_maps/ video_4k.mp4
 ```
 
 ### One-Command Pipeline:
+
 ```bash
 # Complete pipeline
 uv run python run_pipeline.py sbs_1080p.mp4 video_4k.mp4
@@ -88,15 +89,18 @@ Now you can use VisionDepth3D with superior stereo-derived depth.
 
 ```
 video-3d-pipeline/
-├── pyproject.toml             # UV project configuration
-├── README.md                  # This file
+├── pyproject.toml             	# UV project configuration
+├── README.md                  	# This file
 ├── src/video_3d_pipeline/
-│   ├── __init__.py            # Package initialization
-│   ├── align.py          # Video temporal alignment
-│   ├── depth.py               # Depth extraction using hybrid stereo
-│   ├── upscale.py             # Depth upscaling with guided filtering
-│   └── utils.py               # Shared utilities
-└── run_pipeline.py            # Main tool
+│   ├── __init__.py            	# Package initialization
+│   ├── align.py          		# Video temporal alignment
+│   ├── depth.py               	# Depth extraction using hybrid stereo
+│   ├── upscale.py             	# Depth upscaling with guided filtering
+│   └── utils.py               	# Shared utilities
+├── models/						# Pretrained models
+├── IGEV/						# IGEV
+├── unimatch/					# unimatch 
+└── run_pipeline.py            	# Main tool
 ```
 
 ## Dependencies
@@ -109,7 +113,7 @@ video-3d-pipeline/
 - **Matplotlib** - Visualization and plotting
 - **scikit-image** - Image processing algorithms
 - **PyTorch** - Deep learning framework for GPU acceleration
-- **Transformers** - CREStereo model loading and inference
+- **Transformers** - 
 - **CUDA** - GPU compute capability (optional but recommended)
 
 ## Current Status

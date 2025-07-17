@@ -8,23 +8,31 @@ authors = [
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
-    "opencv-python>=4.8.0",
+    # Core video processing
+    "opencv-python>=4.6.0",
     "ffmpeg-python>=0.2.0", 
-    "numpy>=1.24.0",
-    "matplotlib>=3.7.0",
-    "tqdm>=4.65.0",
-    "pillow>=10.0.0",
-    "scikit-image>=0.21.0",
+    "numpy>=1.19.2",
+    "pillow>=9.0.0",
+    "scikit-image>=0.19.0",
+    "imageio>=2.9.0",
+    "imageio-ffmpeg>=0.4.7",
+    
+    # Audio processing for alignment
     "librosa>=0.10.0",
-    "scipy>=1.11.0",
+    "scipy>=1.9.0",
     "soundfile>=0.12.0",
-    "torch>=2.0.0",
-    "torchvision>=0.15.0",
-    "transformers>=4.30.0",
-	"opt_einsum",
-	"tensorboard",
-	"timm==0.5.4",
-	"vpi"
+    
+    # ML framework (compatible with UniMatch)
+    "torch>=1.9.0",
+    "torchvision>=0.10.0",
+    
+    # UniMatch specific dependencies
+    "tensorboard>=2.9.1",
+    "matplotlib>=3.5.0",
+    "tqdm>=4.64.0",
+    
+    # Additional utilities
+    "setuptools>=59.5.0"
 ]
 
 [project.optional-dependencies]
@@ -33,12 +41,26 @@ dev = [
     "black>=23.0.0",
     "ruff>=0.0.290",
 ]
+igev = [
+    # Legacy IGEV dependencies (if you want to keep both)
+    "transformers>=4.30.0",
+    "opt_einsum",
+    "timm==0.5.4"
+]
+unimatch-extra = [
+    # Additional UniMatch optional dependencies
+    "einops>=0.7.0",  # For advanced attention mechanisms
+    "h5py>=3.7.0",    # For some dataset loaders
+    "path>=16.5.0",   # Path utilities
+]
 
 [project.scripts]
 video-align = "video_3d_pipeline.align:main"
 video-depth-extract = "video_3d_pipeline.depth:main"
+video-depth-extract-unimatch = "video_3d_pipeline.unimatch_depth:main"
 video-depth-upscale = "video_3d_pipeline.upscale:main"
 video-3d-convert = "video_3d_pipeline.convert:main"
+video-3d-unimatch-demo = "video_3d_pipeline.unimatch_integration:main"
 
 [build-system]
 requires = ["hatchling"]
