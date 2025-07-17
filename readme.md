@@ -55,7 +55,7 @@ uv sync
 ### Fast Method (Recommended):
 ```bash
 # 1. Quick alignment (seconds)
-uv run python -m video_3d_pipeline.align_fast sbs_1080p.mp4 video_4k.mp4
+uv run python -m video_3d_pipeline.align sbs_1080p.mp4 video_4k.mp4
 
 # 2. Depth extraction with aspect fix
 uv run python -m video_3d_pipeline.depth sbs_1080p.mp4
@@ -92,7 +92,7 @@ video-3d-pipeline/
 ├── README.md                  # This file
 ├── src/video_3d_pipeline/
 │   ├── __init__.py            # Package initialization
-│   ├── align_fast.py          # Video temporal alignment
+│   ├── align.py          # Video temporal alignment
 │   ├── depth.py               # Depth extraction using hybrid stereo
 │   ├── upscale.py             # Depth upscaling with guided filtering
 │   └── utils.py               # Shared utilities
