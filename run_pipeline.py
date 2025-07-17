@@ -73,7 +73,10 @@ def run_pipeline(sbs_video: str,
             work_dir=work_dir,
             cache_dir=work_dir,
             unsqueeze_sbs=True,  # Fix SBS aspect ratio
-            batch_size=8
+            batch_size=4,  # Reduced for memory
+            inference_size=[480, 854],  # Use smaller resolution to save memory
+            num_reg_refine=1,  # Faster processing
+            num_scales=1  # Single scale for speed
         )
         
         depth_dir = extractor.process_video_sbs(

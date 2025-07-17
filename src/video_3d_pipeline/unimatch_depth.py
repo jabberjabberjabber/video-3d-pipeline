@@ -23,6 +23,9 @@ from collections import defaultdict
 from tqdm import tqdm
 import skimage.io
 
+# Suppress the annoying low contrast warning
+warnings.filterwarnings('ignore', message='.*is a low contrast image')
+
 # UniMatch imports
 from unimatch.unimatch import UniMatch
 from utils.utils import InputPadder
@@ -43,18 +46,18 @@ class UniMatchStereoDepthExtractor:
                  work_dir: str = "temp_depth",
                  cache_dir: str = "temp_depth",
                  device: str = "cuda",
-                 batch_size: int = 8,
+                 batch_size: int = 32,  # Increased for RTX 3080
                  unsqueeze_sbs: bool = True,
-                 # UniMatch model parameters
-                 num_scales: int = 2,
+                 # UniMatch model parameters (optimized for speed)
+                 num_scales: int = 1,  # Single scale for speed
                  feature_channels: int = 128,
                  upsample_factor: int = 4,
                  num_head: int = 1,
                  ffn_dim_expansion: int = 4,
                  num_transformer_layers: int = 6,
                  reg_refine: bool = True,
-                 num_reg_refine: int = 3,
-                 attn_type: str = "self_swin2d_cross_swin1d",
+                 num_reg_refine: int = 1,  # Reduced for speed
+                 attn_type: str = "self_swin2d_cross_1d",  # Faster attention
                  attn_splits_list: List[int] = None,
                  corr_radius_list: List[int] = None,
                  prop_radius_list: List[int] = None,
@@ -84,15 +87,25 @@ class UniMatchStereoDepthExtractor:
         self.reg_refine = reg_refine
         self.num_reg_refine = num_reg_refine
         self.attn_type = attn_type
-        self.attn_splits_list = attn_splits_list or [2, 8]
-        self.corr_radius_list = corr_radius_list or [-1, 4]
-        self.prop_radius_list = prop_radius_list or [-1, 1]
+        self.attn_splits_list = attn_splits_list or [2]  # Simplified for speed
+        self.corr_radius_list = corr_radius_list or [-1]  # Global correlation only
+        self.prop_radius_list = prop_radius_list or [-1]  # Global propagation only
+        
+        # Apply PyTorch optimizations for RTX 3080
+        self._apply_pytorch_optimizations()
         
         print(f"Initializing UniMatch Stereo depth extractor...")
         print(f"Device: {self.device}")
         print(f"Model: {self.model_checkpoint}")
-        print(f"Batch size: {self.batch_size}")
+        print(f"Batch size: {self.batch_size} (optimized for RTX 3080)")
         print(f"Scales: {self.num_scales}, Refinement: {self.num_reg_refine}")
+        if self.inference_size:
+            print(f"Inference size: {self.inference_size} (speed optimization)")
+        
+        # Show memory info
+        if torch.cuda.is_available():
+            gpu_memory = torch.cuda.get_device_properties(0).total_memory / 1e9
+            print(f"GPU Memory: {gpu_memory:.1f}GB")
         
         # Initialize model
         self.model = None
@@ -108,6 +121,24 @@ class UniMatchStereoDepthExtractor:
         # Memory management
         self.max_vram_usage = 0.9  # Use 90% of available VRAM
         self.memory_stats = defaultdict(float)
+    
+    def _apply_pytorch_optimizations(self):
+        """ Apply RTX 3080 specific optimizations """
+        if self.device == "cuda" and torch.cuda.is_available():
+            # Enable tensor cores and optimizations
+            torch.backends.cudnn.allow_tf32 = True
+            torch.backends.cuda.matmul.allow_tf32 = True
+            
+            # Enable flash attention if available
+            try:
+                torch.backends.cuda.enable_flash_sdp(True)
+            except:
+                pass
+            
+            # Set memory fraction to avoid fragmentation
+            torch.cuda.set_per_process_memory_fraction(0.95)
+            
+            print("✓ Applied RTX 3080 optimizations")
     
     def load_model(self):
         """ Load UniMatch stereo model to GPU """
@@ -260,59 +291,83 @@ class UniMatchStereoDepthExtractor:
         
         return left_tensor, right_tensor
     
+    def preprocess_frame_batch(self, frame_pairs: List[Tuple[np.ndarray, np.ndarray]]) -> Tuple[torch.Tensor, torch.Tensor]:
+        """ Preprocess batch of frame pairs efficiently """
+        left_batch = []
+        right_batch = []
+        
+        for left_frame, right_frame in frame_pairs:
+            # Convert BGR to RGB
+            left_rgb = cv2.cvtColor(left_frame, cv2.COLOR_BGR2RGB).astype(np.float32)
+            right_rgb = cv2.cvtColor(right_frame, cv2.COLOR_BGR2RGB).astype(np.float32)
+            
+            # Apply transforms
+            sample = {'left': left_rgb, 'right': right_rgb}
+            sample = self.val_transform(sample)
+            
+            left_batch.append(sample['left'])
+            right_batch.append(sample['right'])
+        
+        # Stack into batch tensors
+        left_tensor = torch.stack(left_batch, dim=0).to(self.device)  # [B, 3, H, W]
+        right_tensor = torch.stack(right_batch, dim=0).to(self.device)  # [B, 3, H, W]
+        
+        return left_tensor, right_tensor
+    
     def process_frame_batch(self, frame_pairs: List[Tuple[np.ndarray, np.ndarray]]) -> List[np.ndarray]:
-        """ Process batch of frame pairs for depth estimation using UniMatch """
+        """ Process batch of frame pairs for depth estimation using UniMatch (OPTIMIZED) """
         if not self.model_loaded:
             self.load_model()
+        
+        if len(frame_pairs) == 0:
+            return []
         
         depth_maps = []
         
         with torch.no_grad():
-            for left_frame, right_frame in tqdm(frame_pairs, desc="Processing frames"):
-                try:
-                    # Preprocess frames
-                    left_tensor, right_tensor = self.preprocess_frame_pair(left_frame, right_frame)
+            try:
+                # Process entire batch at once for massive speedup
+                left_batch, right_batch = self.preprocess_frame_batch(frame_pairs)
+                
+                # Handle inference size and padding for entire batch
+                ori_size = left_batch.shape[-2:]
+                
+                if self.inference_size is None:
+                    # Use padding to make divisible by padding_factor
+                    padder = InputPadder(left_batch.shape, padding_factor=self.padding_factor)
+                    left_padded, right_padded = padder.pad(left_batch, right_batch)
+                else:
+                    # Resize to inference size for speed
+                    left_padded = F.interpolate(left_batch, size=self.inference_size, 
+                                              mode='bilinear', align_corners=True)
+                    right_padded = F.interpolate(right_batch, size=self.inference_size, 
+                                               mode='bilinear', align_corners=True)
+                
+                # Run UniMatch stereo on entire batch
+                pred_disps = self.model(left_padded, right_padded,
+                                      attn_type=self.attn_type,
+                                      attn_splits_list=self.attn_splits_list,
+                                      corr_radius_list=self.corr_radius_list,
+                                      prop_radius_list=self.prop_radius_list,
+                                      num_reg_refine=self.num_reg_refine,
+                                      task='stereo')['flow_preds'][-1]  # [B, H, W]
+                
+                # Handle output size for entire batch
+                if self.inference_size is None:
+                    # Unpad result
+                    pred_disps = padder.unpad(pred_disps)  # [B, H, W]
+                else:
+                    # Resize back to original size
+                    pred_disps = F.interpolate(pred_disps.unsqueeze(1), size=ori_size, 
+                                            mode='bilinear', align_corners=True).squeeze(1)  # [B, H, W]
+                    # Scale disparity values
+                    pred_disps = pred_disps * ori_size[-1] / float(self.inference_size[-1])
+                
+                # Convert batch to individual depth maps
+                for i in range(pred_disps.shape[0]):
+                    disp_np = pred_disps[i].cpu().numpy()
                     
-                    # Handle inference size and padding
-                    ori_size = left_tensor.shape[-2:]
-                    
-                    if self.inference_size is None:
-                        # Use padding to make divisible by padding_factor
-                        padder = InputPadder(left_tensor.shape, padding_factor=self.padding_factor)
-                        left_padded, right_padded = padder.pad(left_tensor, right_tensor)
-                        resize_back = False
-                    else:
-                        # Resize to inference size
-                        left_padded = F.interpolate(left_tensor, size=self.inference_size, 
-                                                  mode='bilinear', align_corners=True)
-                        right_padded = F.interpolate(right_tensor, size=self.inference_size, 
-                                                   mode='bilinear', align_corners=True)
-                        resize_back = True
-                    
-                    # Run UniMatch stereo
-                    pred_disp = self.model(left_padded, right_padded,
-                                         attn_type=self.attn_type,
-                                         attn_splits_list=self.attn_splits_list,
-                                         corr_radius_list=self.corr_radius_list,
-                                         prop_radius_list=self.prop_radius_list,
-                                         num_reg_refine=self.num_reg_refine,
-                                         task='stereo')['flow_preds'][-1]  # [1, H, W]
-                    
-                    # Handle output size
-                    if self.inference_size is None:
-                        # Unpad result
-                        pred_disp = padder.unpad(pred_disp)[0]  # [H, W]
-                    else:
-                        # Resize back to original size
-                        pred_disp = F.interpolate(pred_disp.unsqueeze(1), size=ori_size, 
-                                                mode='bilinear', align_corners=True).squeeze(1)[0]  # [H, W]
-                        # Scale disparity values
-                        pred_disp = pred_disp * ori_size[-1] / float(self.inference_size[-1])
-                    
-                    # Convert disparity to depth (simple inverse relationship)
-                    disp_np = pred_disp.cpu().numpy()
-                    
-                    # Convert disparity to depth - you may want to adjust this based on your stereo setup
+                    # Convert disparity to depth
                     depth_map = np.where(disp_np > 0, 1.0 / (disp_np + 1e-6), 0)
                     
                     # Normalize depth to 0-1 range for saving
@@ -321,14 +376,12 @@ class UniMatchStereoDepthExtractor:
                     
                     depth_maps.append(depth_map.astype(np.float32))
                     
-                except Exception as e:
-                    print(f"Error processing frame pair: {e}")
-                    # Create dummy depth map on error
+            except Exception as e:
+                print(f"Error processing frame batch: {e}")
+                # Create dummy depth maps on error
+                for left_frame, right_frame in frame_pairs:
                     h, w = left_frame.shape[:2]
                     depth_maps.append(np.zeros((h, w), dtype=np.float32))
-                
-                # Clean up GPU memory
-                torch.cuda.empty_cache()
         
         return depth_maps
     
@@ -422,8 +475,8 @@ def main():
                        help='Starting frame number (default: 0)')
     parser.add_argument('--max-frames', type=int, default=None,
                        help='Maximum number of frames to process (default: all)')
-    parser.add_argument('--batch-size', type=int, default=8,
-                       help='Batch size for GPU processing (default: 8)')
+    parser.add_argument('--batch-size', type=int, default=32,
+                       help='Batch size for GPU processing (default: 32 for RTX 3080)')
     parser.add_argument('--model', default="./models/gmstereo-scale2-regrefine3-resumeflowthings-middleburyfthighres-a82bec03.pth",
                        help='UniMatch model checkpoint path')
     parser.add_argument('--work-dir', default='temp_depth',
@@ -434,17 +487,21 @@ def main():
                        help='Processing device (default: cuda)')
     parser.add_argument('--no-unsqueeze', action='store_true',
                        help='Skip SBS unsqueezing (keep squeezed aspect ratio)')
-    parser.add_argument('--num-scales', type=int, default=2,
-                       help='Number of feature scales (default: 2)')
-    parser.add_argument('--num-reg-refine', type=int, default=3,
-                       help='Number of refinement iterations (default: 3)')
-    parser.add_argument('--inference-size', type=int, nargs=2, default=None,
-                       help='Inference size [height width] (default: auto)')
+    parser.add_argument('--num-scales', type=int, default=1,
+                       help='Number of feature scales (default: 1 for speed)')
+    parser.add_argument('--num-reg-refine', type=int, default=1,
+                       help='Number of refinement iterations (default: 1 for speed)')
+    parser.add_argument('--inference-size', type=int, nargs=2, default=[480, 854],
+                       help='Inference size [height width] (default: [480, 854] for speed)')
     
     args = parser.parse_args()
     
     # Handle flags
     unsqueeze_sbs = not args.no_unsqueeze
+    
+    # Optimization suggestions
+    if args.batch_size > 16 and args.inference_size is None:
+        print("⚠️  Large batch size with full resolution may cause OOM. Consider --inference-size 480 854")
     
     try:
         # Initialize depth extractor
