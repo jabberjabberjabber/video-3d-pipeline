@@ -23,7 +23,8 @@ dependencies = [
     "transformers>=4.30.0",
 	"opt_einsum",
 	"tensorboard",
-	"timm==0.5.4"
+	"timm==0.5.4",
+	"vpi"
 ]
 
 [project.optional-dependencies]

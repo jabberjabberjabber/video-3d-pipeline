@@ -2241,6 +2241,7 @@ dependencies = [
     { name = "torchvision", version = "0.22.1+cu128", source = { registry = "https://download.pytorch.org/whl/cu128" }, marker = "platform_machine != 'aarch64' or sys_platform != 'linux'" },
     { name = "tqdm" },
     { name = "transformers" },
+    { name = "vpi" },
 ]
 
 [package.optional-dependencies]
@@ -2271,8 +2272,18 @@ requires-dist = [
     { name = "torchvision", specifier = ">=0.15.0", index = "https://download.pytorch.org/whl/cu128" },
     { name = "tqdm", specifier = ">=4.65.0" },
     { name = "transformers", specifier = ">=4.30.0" },
+    { name = "vpi" },
 ]
 provides-extras = ["dev"]
+
+[[package]]
+name = "vpi"
+version = "0.1.2"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/29/81/ae3b0c2c929d76ec301513316f70a65fe69d15f638fc22f857d69e38cbb1/VPi-0.1.2.tar.gz", hash = "sha256:b563ebfac265c93da5001646e67c973fe61313be93117f33a54e5bcfbe2fb981", size = 9634, upload-time = "2021-04-20T10:35:35.151Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/a9/e9/1a1721eb15a4ce9a072c0e76d78f2b3fb2bb98ddaa7f26cd03c528c49886/VPi-0.1.2-py3-none-any.whl", hash = "sha256:f4d9701f09e8a697f793bef5038e7cb2aa3f904d1adcade33bae5080bdbc5626", size = 13283, upload-time = "2021-04-20T10:35:33.738Z" },
+]
 
 [[package]]
 name = "werkzeug"

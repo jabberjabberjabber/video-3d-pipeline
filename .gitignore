@@ -90,7 +90,8 @@ src/video_3d_pipeline/_upscale.py
 /temp_fast_test
 /temp_pipeline_test
 /.crap
-/IGEV/core
-/IGEV
+
+
 /IGEV__
 /models
+/src/video_3d_pipeline/depth

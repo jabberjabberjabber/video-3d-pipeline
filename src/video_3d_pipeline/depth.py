@@ -1,55 +1,78 @@
-"""Depth extraction from SBS stereoscopic video using CREStereo."""
+"""Depth extraction from SBS stereoscopic video using IGEV stereo."""
+
+import sys
+import os
+from pathlib import Path
+
+# Add IGEV to path
+project_root = Path(__file__).parent.parent.parent
+igev_path = project_root / "IGEV"
+sys.path.append(str(igev_path))
+sys.path.append(str(igev_path / "core"))
 
 import torch
 import torch.nn.functional as F
 import numpy as np
 import cv2
 import ffmpeg
-from pathlib import Path
 import hashlib
-import os
 import argparse
 from typing import Tuple, List, Optional, Dict
 import gc
 import warnings
 from collections import defaultdict
+from tqdm import tqdm
+import skimage.io
+
+from core.igev_stereo import IGEVStereo
+from core.utils.utils import InputPadder
 
 from .utils import get_video_info, create_work_directory
 
 
-class HybridStereoDepthExtractor:
-    """ GPU-accelerated depth extraction from SBS video using hybrid stereo matching + neural guidance """
+class IGEVStereoDepthExtractor:
+    """ GPU-accelerated depth extraction from SBS video using IGEV stereo """
     
     def __init__(self, 
-                 model_checkpoint: str = "Intel/dpt-large",
+                 model_checkpoint: str = "./models/sceneflow.pth",
                  work_dir: str = "temp_depth",
                  cache_dir: str = "temp_depth",
                  device: str = "cuda",
-                 batch_size: int = 8,
-                 use_neural_guidance: bool = True,
-                 stereo_only: bool = False,
-                 unsqueeze_sbs: bool = True):
+                 batch_size: int =16,
+                 unsqueeze_sbs: bool = True,
+                 valid_iters: int = 32):
         
         self.device = device
         self.work_dir = create_work_directory(work_dir)
         self.cache_dir = create_work_directory(cache_dir)
         self.batch_size = batch_size
-        self.model_checkpoint = model_checkpoint
-        self.use_neural_guidance = use_neural_guidance
-        self.stereo_only = stereo_only
         self.unsqueeze_sbs = unsqueeze_sbs
+        self.valid_iters = valid_iters
         
         # Verify CUDA availability
         if device == "cuda" and not torch.cuda.is_available():
             raise RuntimeError("CUDA not available but requested")
         
-        print(f"Initializing Hybrid Stereo depth extractor...")
-        print(f"Device: {self.device}")
-        print(f"Model: {self.model_checkpoint if not self.stereo_only else 'Stereo-only mode'}")
-        print(f"Batch size: {self.batch_size}")
-        print(f"Neural guidance: {self.use_neural_guidance and not self.stereo_only}")
+        # Set model checkpoint path
+        if model_checkpoint is None:
+            # Default to one of the available models
+            models_dir = project_root / "models" / "Selective-IGEV"
+            if (models_dir / "sceneflow").exists():
+                self.model_checkpoint = str(models_dir / "sceneflow")
+            elif (models_dir / "eth3d").exists():
+                self.model_checkpoint = str(models_dir / "eth3d")
+            else:
+                raise ValueError(f"No IGEV models found in {models_dir}")
+        else:
+            self.model_checkpoint = model_checkpoint
         
-        # Initialize model (will be loaded on first use)
+        print(f"Initializing IGEV Stereo depth extractor...")
+        print(f"Device: {self.device}")
+        print(f"Model: {self.model_checkpoint}")
+        print(f"Batch size: {self.batch_size}")
+        print(f"Valid iterations: {self.valid_iters}")
+        
+        # Initialize model args (will be loaded with model)
         self.model = None
         self.model_loaded = False
         
@@ -58,60 +81,56 @@ class HybridStereoDepthExtractor:
         self.memory_stats = defaultdict(float)
     
     def load_model(self):
-        """ Load depth estimation model to GPU """
+        """ Load IGEV stereo model to GPU """
         if self.model_loaded:
             return
         
-        if self.stereo_only:
-            print("Using stereo-only mode (no neural network)")
-            self.model_loaded = True
-            return
+        print(f"Loading IGEV model from {self.model_checkpoint}...")
         
-        print(f"Loading depth model: {self.model_checkpoint}")
+        # Create args object with default IGEV parameters
+        class Args:
+            def __init__(self):
+                self.mixed_precision = True
+                self.precision_dtype = "float16"
+                self.hidden_dims = [128] * 3
+                self.corr_implementation = "reg"
+                self.shared_backbone = False
+                self.corr_levels = 2
+                self.corr_radius = 4
+                self.n_downsample = 2
+                self.slow_fast_gru = False
+                self.n_gru_layers = 3
+                self.max_disp = 192
+        
+        args = Args()
+        
+        # Initialize model
+        self.model = torch.nn.DataParallel(IGEVStereo(args), device_ids=[0])
+        
+        # Load checkpoint
+        checkpoint_path = Path(self.model_checkpoint)
+        if checkpoint_path.is_dir():
+            # Look for .pth files in directory
+            pth_files = list(checkpoint_path.glob("*.pth"))
+            if not pth_files:
+                raise ValueError(f"No .pth checkpoint files found in {checkpoint_path}")
+            checkpoint_path = pth_files[0]  # Use first .pth file found
+        
+        if not checkpoint_path.exists():
+            raise ValueError(f"Checkpoint not found: {checkpoint_path}")
         
         try:
-            # Use DPT for monocular depth estimation as guidance
-            from transformers import DPTImageProcessor, DPTForDepthEstimation
-            
-            print("Loading DPT model for neural depth guidance")
-            self.processor = DPTImageProcessor.from_pretrained(self.model_checkpoint)
-            self.model = DPTForDepthEstimation.from_pretrained(self.model_checkpoint)
-            
-            # Move to GPU
-            if self.device == "cuda":
-                self.model = self.model.to(self.device)
-                self.model.eval()
-                
-                # Get GPU memory info
-                total_memory = torch.cuda.get_device_properties(0).total_memory / 1e9
-                print(f"GPU: {torch.cuda.get_device_name(0)}")
-                print(f"Total VRAM: {total_memory:.1f}GB")
-                
-                # Check model memory usage
-                torch.cuda.empty_cache()
-                model_memory = torch.cuda.memory_allocated() / 1e9
-                print(f"Model VRAM usage: {model_memory:.1f}GB")
-                
-                # Calculate optimal batch size based on remaining memory
-                available_memory = (total_memory * self.max_vram_usage) - model_memory
-                estimated_per_frame = 0.8  # GB per 1080p frame pair (rough estimate)
-                optimal_batch = max(1, int(available_memory / estimated_per_frame))
-                
-                if optimal_batch < self.batch_size:
-                    print(f"Reducing batch size from {self.batch_size} to {optimal_batch} for memory")
-                    self.batch_size = optimal_batch
-                
-            self.model_loaded = True
-            print("✓ Model loaded successfully")
-            
-        except ImportError:
-            print("Warning: transformers library not available, falling back to stereo-only mode")
-            self.stereo_only = True
-            self.model_loaded = True
+            self.model.load_state_dict(torch.load(str(checkpoint_path), map_location=self.device))
+            print(f"✓ Loaded checkpoint: {checkpoint_path}")
         except Exception as e:
-            print(f"Warning: Failed to load neural model, falling back to stereo-only mode: {e}")
-            self.stereo_only = True
-            self.model_loaded = True
+            raise RuntimeError(f"Failed to load checkpoint {checkpoint_path}: {e}")
+        
+        self.model = self.model.module
+        self.model.to(self.device)
+        self.model.eval()
+        
+        self.model_loaded = True
+        print("✓ IGEV model loaded successfully")
     
     def get_cache_path(self, video_path: str, frame_start: int, frame_count: int) -> Path:
         """ Generate cache path for depth maps """
@@ -187,66 +206,6 @@ class HybridStereoDepthExtractor:
         print(f"✓ Extracted {len(frames)} frames")
         return frames
         
-    def extract_frames_ffmpeg(self, video_path: str, start_frame: int = 0, max_frames: int = None) -> List[np.ndarray]:
-        """ Extract video frames using ffmpeg """
-        print(f"Extracting frames from {video_path}...")
-        
-        # Get video info
-        video_info = get_video_info(video_path)
-        if not video_info:
-            raise ValueError(f"Could not read video info: {video_path}")
-        
-        total_frames = video_info.get('frames', 0) or int(video_info['duration'] * video_info['fps'])
-        
-        if max_frames is None:
-            max_frames = total_frames - start_frame
-        else:
-            max_frames = min(max_frames, total_frames - start_frame)
-        
-        print(f"Extracting {max_frames} frames starting from frame {start_frame}")
-        
-        frames = []
-        
-        try:
-            # Create ffmpeg process for frame extraction
-            start_time = start_frame / video_info['fps']
-            duration = max_frames / video_info['fps']
-            
-            process = (
-                ffmpeg
-                .input(video_path, ss=start_time, t=duration)
-                .output('pipe:', format='rawvideo', pix_fmt='rgb24')
-                .run_async(pipe_stdout=True, pipe_stderr=True, quiet=True)
-            )
-            
-            frame_size = video_info['width'] * video_info['height'] * 3  # RGB
-            
-            frame_count = 0
-            while frame_count < max_frames:
-                # Read frame data
-                frame_data = process.stdout.read(frame_size)
-                if not frame_data or len(frame_data) != frame_size:
-                    break
-                
-                # Convert to numpy array
-                frame = np.frombuffer(frame_data, np.uint8).reshape(
-                    (video_info['height'], video_info['width'], 3)
-                )
-                
-                frames.append(frame)
-                frame_count += 1
-                
-                if frame_count % 100 == 0:
-                    print(f"Extracted {frame_count}/{max_frames} frames...")
-            
-            process.wait()
-            
-        except Exception as e:
-            raise RuntimeError(f"Frame extraction failed: {e}")
-        
-        print(f"✓ Extracted {len(frames)} frames")
-        return frames
-    
     def split_sbs_frame(self, sbs_frame: np.ndarray, unsqueeze: bool = True) -> Tuple[np.ndarray, np.ndarray]:
         """ Split side-by-side frame into left and right images """
         height, width = sbs_frame.shape[:2]
@@ -267,143 +226,75 @@ class HybridStereoDepthExtractor:
         
         return left_frame, right_frame
     
-    def preprocess_frame_pair(self, left_frame: np.ndarray, right_frame: np.ndarray) -> Dict:
-        """ Preprocess frame pair for depth estimation """
-        # Convert BGR to RGB if needed (OpenCV default is BGR)
-        if left_frame.shape[2] == 3:
-            left_rgb = cv2.cvtColor(left_frame, cv2.COLOR_BGR2RGB)
-            right_rgb = cv2.cvtColor(right_frame, cv2.COLOR_BGR2RGB)
-        else:
-            left_rgb = left_frame
-            right_rgb = right_frame
+    def load_image_tensor(self, image: np.ndarray) -> torch.Tensor:
+        """ Convert numpy image to tensor for IGEV """
+        # Convert BGR to RGB if needed
+        if len(image.shape) == 3 and image.shape[2] == 3:
+            image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         
-        result = {'stereo_pair': {'left': left_rgb, 'right': right_rgb}}
-        
-        # Only process for neural guidance if needed
-        if self.use_neural_guidance and not self.stereo_only and hasattr(self, 'processor'):
-            try:
-                inputs = self.processor(images=left_rgb, return_tensors="pt")
-                
-                # Move to device
-                if self.device == "cuda":
-                    inputs = {k: v.to(self.device) for k, v in inputs.items()}
-                
-                result['dpt_inputs'] = inputs
-            except Exception as e:
-                print(f"Warning: Neural preprocessing failed: {e}")
-        
-        return result
+        # Convert to tensor format expected by IGEV
+        img_tensor = torch.from_numpy(image).permute(2, 0, 1).float()
+        return img_tensor[None].to(self.device)
     
     def process_frame_batch(self, frame_pairs: List[Tuple[np.ndarray, np.ndarray]]) -> List[np.ndarray]:
-        """ Process batch of frame pairs for depth estimation """
+        """ Process batch of frame pairs for depth estimation using IGEV """
         if not self.model_loaded:
             self.load_model()
         
-        batch_size = len(frame_pairs)
-        print(f"Processing batch of {batch_size} frame pairs...")
-        
-        # Check GPU memory before processing
-        if self.device == "cuda":
-            torch.cuda.empty_cache()
-            memory_before = torch.cuda.memory_allocated() / 1e9
-            print(f"GPU memory before batch: {memory_before:.1f}GB")
-        
         depth_maps = []
         
-        try:
-            # Create stereo matcher for traditional stereo matching
-            stereo = cv2.StereoSGBM_create(
-                minDisparity=0,
-                numDisparities=64,  # Must be divisible by 16
-                blockSize=5,
-                P1=8 * 3 * 5**2,
-                P2=32 * 3 * 5**2,
-                disp12MaxDiff=1,
-                uniquenessRatio=10,
-                speckleWindowSize=100,
-                speckleRange=32
-            )
-            
-            with torch.no_grad():
-                # Process each pair
-                for i, (left, right) in enumerate(frame_pairs):
-                    print(f"  Processing pair {i+1}/{batch_size}...")
+        with torch.no_grad():
+            for left_frame, right_frame in tqdm(frame_pairs, desc="Processing frames"):
+                try:
+                    # Convert frames to tensors
+                    left_tensor = self.load_image_tensor(left_frame)
+                    right_tensor = self.load_image_tensor(right_frame)
                     
-                    # Preprocess frames
-                    processed = self.preprocess_frame_pair(left, right)
-                    stereo_pair = processed['stereo_pair']
+                    # Pad images to be divisible by 32
+                    padder = InputPadder(left_tensor.shape, divis_by=32)
+                    left_padded, right_padded = padder.pad(left_tensor, right_tensor)
                     
-                    # Convert to grayscale for stereo matching
-                    left_gray = cv2.cvtColor(stereo_pair['left'], cv2.COLOR_RGB2GRAY)
-                    right_gray = cv2.cvtColor(stereo_pair['right'], cv2.COLOR_RGB2GRAY)
+                    # Run IGEV stereo
+                    disparity = self.model(left_padded, right_padded, 
+                                         iters=self.valid_iters, test_mode=True)
                     
-                    # Compute disparity using stereo matching
-                    disparity = stereo.compute(left_gray, right_gray).astype(np.float32) / 16.0
+                    # Unpad result
+                    disparity = padder.unpad(disparity)
                     
-                    # Optional: Use neural guidance if enabled and available
-                    if (self.use_neural_guidance and not self.stereo_only and 
-                        hasattr(self, 'model') and 'dpt_inputs' in processed):
-                        try:
-                            dpt_inputs = processed['dpt_inputs']
-                            dpt_outputs = self.model(**dpt_inputs)
-                            monocular_depth = dpt_outputs.predicted_depth[0].cpu().numpy()
-                            
-                            # Resize monocular depth to match disparity
-                            if monocular_depth.shape != disparity.shape:
-                                monocular_depth = cv2.resize(monocular_depth, 
-                                                            (disparity.shape[1], disparity.shape[0]))
-                            
-                            # Combine stereo disparity with monocular depth (weighted average)
-                            # Normalize monocular depth to disparity range
-                            if monocular_depth.max() > monocular_depth.min():
-                                mono_normalized = ((monocular_depth - monocular_depth.min()) / 
-                                                 (monocular_depth.max() - monocular_depth.min()) * 64)
-                                
-                                # Weighted combination (favor stereo for accuracy)
-                                combined_disparity = 0.7 * disparity + 0.3 * mono_normalized
-                            else:
-                                combined_disparity = disparity
-                                
-                        except Exception as e:
-                            print(f"    Warning: Neural guidance failed, using stereo only: {e}")
-                            combined_disparity = disparity
-                    else:
-                        combined_disparity = disparity
+                    # Convert to numpy
+                    disp_np = disparity.cpu().numpy().squeeze()
                     
-                    # Clean up disparity (remove invalid values)
-                    combined_disparity[combined_disparity <= 0] = 0
+                    # Convert disparity to depth (simple inverse relationship)
+                    # You may want to adjust this based on your stereo setup
+                    depth_map = np.where(disp_np > 0, 1.0 / (disp_np + 1e-6), 0)
                     
-                    depth_maps.append(combined_disparity.astype(np.float32))
+                    # Normalize depth to 0-1 range for saving
+                    if depth_map.max() > depth_map.min():
+                        depth_map = (depth_map - depth_map.min()) / (depth_map.max() - depth_map.min())
+                    
+                    depth_maps.append(depth_map)
+                    
+                except Exception as e:
+                    print(f"Error processing frame pair: {e}")
+                    # Create dummy depth map on error
+                    h, w = left_frame.shape[:2]
+                    depth_maps.append(np.zeros((h, w), dtype=np.float32))
                 
-        except torch.cuda.OutOfMemoryError as e:
-            print(f"GPU memory error in batch processing: {e}")
-            print("Try reducing batch size")
-            torch.cuda.empty_cache()
-            raise
-        except Exception as e:
-            print(f"Error processing frame batch: {e}")
-            raise
-        
-        finally:
-            # Clean up GPU memory
-            if self.device == "cuda":
+                # Clean up GPU memory
                 torch.cuda.empty_cache()
-                memory_after = torch.cuda.memory_allocated() / 1e9
-                print(f"GPU memory after batch: {memory_after:.1f}GB")
         
-        print(f"✓ Processed {len(depth_maps)} depth maps")
         return depth_maps
     
     def save_depth_map(self, depth_map: np.ndarray, output_path: Path):
         """ Save depth map as 16-bit PNG """
-        # Normalize to 16-bit range
-        if depth_map.max() > depth_map.min():
-            normalized = ((depth_map - depth_map.min()) / (depth_map.max() - depth_map.min()) * 65535).astype(np.uint16)
-        else:
-            normalized = np.zeros_like(depth_map, dtype=np.uint16)
+        # Convert to 16-bit for saving
+        depth_16bit = np.round(depth_map * 65535).astype(np.uint16)
         
-        # Save as PNG
-        cv2.imwrite(str(output_path), normalized)
+        # Ensure output directory exists
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        
+        # Save using skimage
+        skimage.io.imsave(str(output_path), depth_16bit)
     
     def process_video_sbs(self, 
                          video_path: str, 
@@ -478,47 +369,42 @@ class HybridStereoDepthExtractor:
 
 def main():
     """ Command line interface for depth extraction """
-    parser = argparse.ArgumentParser(description='Extract depth maps from SBS stereoscopic video')
+    parser = argparse.ArgumentParser(description='Extract depth maps from SBS stereoscopic video using IGEV')
     parser.add_argument('video', help='Path to SBS video file')
     parser.add_argument('--start-frame', type=int, default=0,
                        help='Starting frame number (default: 0)')
     parser.add_argument('--max-frames', type=int, default=None,
                        help='Maximum number of frames to process (default: all)')
-    parser.add_argument('--batch-size', type=int, default=8,
-                       help='Batch size for GPU processing (default: 8)')
-    parser.add_argument('--model', default="Intel/dpt-large",
-                       help='Neural model checkpoint (default: Intel/dpt-large)')
+    parser.add_argument('--batch-size', type=int, default=4,
+                       help='Batch size for GPU processing (default: 4)')
+    parser.add_argument('--model', default=None,
+                       help='IGEV model checkpoint path (default: auto-detect)')
     parser.add_argument('--work-dir', default='temp_depth',
                        help='Working directory for output (default: temp_depth)')
     parser.add_argument('--force', action='store_true',
                        help='Force reprocessing even if cached results exist')
     parser.add_argument('--device', default='cuda',
                        help='Processing device (default: cuda)')
-    parser.add_argument('--stereo-only', action='store_true',
-                       help='Use stereo matching only (no neural guidance)')
-    parser.add_argument('--no-neural', action='store_true',
-                       help='Disable neural guidance (same as --stereo-only)')
     parser.add_argument('--no-unsqueeze', action='store_true',
                        help='Skip SBS unsqueezing (keep squeezed aspect ratio)')
+    parser.add_argument('--valid-iters', type=int, default=32,
+                       help='Number of IGEV refinement iterations (default: 32)')
     
     args = parser.parse_args()
     
-    # Handle neural guidance flags
-    stereo_only = args.stereo_only or args.no_neural
-    use_neural_guidance = not stereo_only
+    # Handle flags
     unsqueeze_sbs = not args.no_unsqueeze
     
     try:
         # Initialize depth extractor
-        extractor = HybridStereoDepthExtractor(
+        extractor = IGEVStereoDepthExtractor(
             model_checkpoint=args.model,
             work_dir=args.work_dir,
             cache_dir=args.work_dir,
             device=args.device,
             batch_size=args.batch_size,
-            use_neural_guidance=use_neural_guidance,
-            stereo_only=stereo_only,
-            unsqueeze_sbs=unsqueeze_sbs
+            unsqueeze_sbs=unsqueeze_sbs,
+            valid_iters=args.valid_iters
         )
         
         # Process video
