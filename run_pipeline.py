@@ -10,7 +10,7 @@ sys.path.insert(0, str(Path(__file__).parent / 'src'))
 
 from video_3d_pipeline.align import VideoAligner
 from video_3d_pipeline.upscale import SimpleDepthUpscaler
-from video_3d_pipeline.unimatch_depth import UniMatchStereoDepthExtractor
+from video_3d_pipeline.unimatch_depth import UniMatchStereoDepthExtractor, StereoFormat
 
 
 def run_pipeline(sbs_video: str, 
@@ -20,11 +20,12 @@ def run_pipeline(sbs_video: str,
                 skip_alignment: bool = False,
                 skip_depth: bool = False,
                 skip_upscale: bool = False,
-                force_reprocess: bool = False):
+                force_reprocess: bool = False,
+                stereo_format: StereoFormat = StereoFormat.HALF_SBS):
     """Run the complete optimized pipeline."""
     
     print("=== OPTIMIZED 3D VIDEO PIPELINE ===")
-    print(f"SBS 1080p: {sbs_video}")
+    print(f"Stereo video: {sbs_video} ({stereo_format.value})")
     print(f"4K video: {video_4k}")
     print(f"Work dir: {work_dir}")
     if max_frames:
@@ -72,7 +73,8 @@ def run_pipeline(sbs_video: str,
         extractor = UniMatchStereoDepthExtractor(
             work_dir=work_dir,
             cache_dir=work_dir,
-            unsqueeze_sbs=True,  # Fix SBS aspect ratio
+            stereo_format=stereo_format,
+            unsqueeze_sbs=True,  # Fix aspect ratio
             batch_size=4,  # Reduced for memory
             inference_size=[480, 854],  # Use smaller resolution to save memory
             num_reg_refine=1,  # Faster processing
@@ -144,12 +146,15 @@ def run_pipeline(sbs_video: str,
 def main():
     """Command line interface for the optimized pipeline."""
     parser = argparse.ArgumentParser(description='Optimized 3D video pipeline')
-    parser.add_argument('sbs_video', help='Path to SBS 1080p video')
+    parser.add_argument('sbs_video', help='Path to stereoscopic video (any supported format)')
     parser.add_argument('video_4k', help='Path to 4K 2D video')
     parser.add_argument('--work-dir', default='temp_pipeline',
                        help='Working directory (default: temp_pipeline)')
     parser.add_argument('--max-frames', type=int,
                        help='Maximum frames to process (for testing)')
+    parser.add_argument('--stereo-format', choices=[f.value for f in StereoFormat],
+                       default=StereoFormat.HALF_SBS.value,
+                       help='Stereoscopic input format (default: half_sbs)')
     parser.add_argument('--skip-alignment', action='store_true',
                        help='Skip alignment step')
     parser.add_argument('--skip-depth', action='store_true', 
@@ -170,7 +175,8 @@ def main():
             skip_alignment=args.skip_alignment,
             skip_depth=args.skip_depth,
             skip_upscale=args.skip_upscale,
-            force_reprocess=args.force
+            force_reprocess=args.force,
+            stereo_format=StereoFormat(args.stereo_format)
         )
         
         print("\n🎉 Pipeline completed successfully!")
