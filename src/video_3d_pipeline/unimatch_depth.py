@@ -63,7 +63,9 @@ class UniMatchStereoDepthExtractor:
                  corr_radius_list: List[int] = None,
                  prop_radius_list: List[int] = None,
                  padding_factor: int = 32,
-                 inference_size: Optional[List[int]] = None):
+                 inference_size: Optional[List[int]] = None,
+                 target_output_size: Optional[List[int]] = None,  # Direct output size [H, W]
+                 target_fps: Optional[float] = None):
         
         self.device = device
         self.work_dir = create_work_directory(work_dir)
@@ -73,6 +75,8 @@ class UniMatchStereoDepthExtractor:
         self.model_checkpoint = model_checkpoint
         self.padding_factor = padding_factor
         self.inference_size = inference_size
+        self.target_output_size = target_output_size  # [H, W] for direct 4K output
+        self.target_fps = target_fps
         
         # Verify CUDA availability
         if device == "cuda" and not torch.cuda.is_available():
@@ -102,6 +106,8 @@ class UniMatchStereoDepthExtractor:
         print(f"Scales: {self.num_scales}, Refinement: {self.num_reg_refine}")
         if self.inference_size:
             print(f"Inference size: {self.inference_size} (speed optimization)")
+        if self.target_output_size:
+            print(f"Target output: {self.target_output_size[1]}x{self.target_output_size[0]} (direct 4K)")
         
         # Show memory info
         if torch.cuda.is_available():
@@ -184,17 +190,16 @@ class UniMatchStereoDepthExtractor:
     
     def get_cache_path(self, video_path: str, frame_start: int, frame_count: int) -> Path:
         """ Generate cache path for depth maps """
-        # Create cache key from video path and frame range
-        cache_key = f"{video_path}_{frame_start}_{frame_count}_{self.model_checkpoint}_{self.unsqueeze_sbs}"
+        # Include target output size in cache key for direct 4K
+        target_info = f"{self.target_output_size}" if self.target_output_size else "auto"
+        cache_key = f"{video_path}_{frame_start}_{frame_count}_{self.model_checkpoint}_{self.unsqueeze_sbs}_{target_info}"
         cache_hash = hashlib.md5(cache_key.encode()).hexdigest()[:16]
         
         cache_subdir = self.cache_dir / f"depth_{cache_hash}"
         cache_subdir.mkdir(exist_ok=True)
         
         return cache_subdir
-    def is_cached(self, cache_path: Path, frame_count: int) -> bool:
-        """ Check if depth video is already cached (legacy method for compatibility) """
-        return self.is_video_cached(cache_path)
+
     def get_frame_generator(self, video_path: str, start_frame: int = 0, max_frames: int = None):
         """ Generator that yields frames one at a time to avoid memory issues """
         print(f"Setting up frame generator for {video_path}...")
@@ -348,6 +353,15 @@ class UniMatchStereoDepthExtractor:
                     # Scale disparity values
                     pred_disps = pred_disps * ori_size[-1] / float(self.inference_size[-1])
                 
+                # Apply direct 4K upscaling if specified
+                if self.target_output_size is not None:
+                    target_size = self.target_output_size  # [H, W]
+                    pred_disps = F.interpolate(pred_disps.unsqueeze(1), size=target_size, 
+                                            mode='bilinear', align_corners=True).squeeze(1)  # [B, target_H, target_W]
+                    # Scale disparity values for new resolution
+                    pred_disps = pred_disps * target_size[-1] / float(ori_size[-1])
+                    print(f"✓ Direct upscaled to {target_size[1]}x{target_size[0]}")
+                
                 # Convert batch to individual depth maps
                 for i in range(pred_disps.shape[0]):
                     disp_np = pred_disps[i].cpu().numpy()
@@ -383,17 +397,20 @@ class UniMatchStereoDepthExtractor:
         """ Create FFmpeg video writer for depth maps """
         output_video_path = cache_path / "depth_video.mp4"
         
-        # Use efficient encoding for depth data
+        # Use target FPS if specified, otherwise use video FPS
+        fps = self.target_fps if self.target_fps is not None else video_info['fps']
+        
+        # Use efficient HEVC encoding for depth data
         writer = (
             ffmpeg
             .input('pipe:', format='rawvideo', pix_fmt='gray16le', 
                    s=f"{output_width}x{output_height}", 
-                   r=video_info['fps'])
+                   r=fps)
             .output(str(output_video_path), 
-                   vcodec='libx265',  # H.265 for better compression
-                   crf=18,  # High quality, good compression
+                   vcodec='hevc_nvenc',  # HEVC for better compression
+                   crf=20,  # High quality
                    pix_fmt='yuv420p10le',  # 10-bit for depth precision
-                   preset='fast')  # Reasonable encoding speed
+                   preset='p4')  # Reasonable speed
             .overwrite_output()
             .run_async(pipe_stdin=True)
         )
@@ -411,7 +428,16 @@ class UniMatchStereoDepthExtractor:
     
     
     def calculate_output_dimensions(self, video_info: dict) -> Tuple[int, int]:
-        """ Calculate output depth map dimensions based on stereo format """
+        """ 	Calculate output depth map dimensions based on stereo format
+				and target output size.
+
+		"""
+        
+        # If target output size is specified, use it directly
+        if self.target_output_size is not None:
+            return self.target_output_size[1], self.target_output_size[0]  # [W, H]
+        
+        # Otherwise calculate from input video
         input_width = video_info['width']
         input_height = video_info['height']
         eye_width = input_width // 2
@@ -426,7 +452,8 @@ class UniMatchStereoDepthExtractor:
             output_width = eye_width
             output_height = eye_height
         
-        return output_width, output_height    
+        return output_width, output_height
+    
     def is_video_cached(self, cache_path: Path) -> bool:
         """ Check if depth video is already cached """
         video_path = cache_path / "depth_video.mp4"
@@ -456,8 +483,7 @@ class UniMatchStereoDepthExtractor:
         print(f"Video info: {video_info['width']}x{video_info['height']} @ {video_info['fps']:.1f}fps")
         print(f"Processing {frame_count} frames starting from frame {start_frame}")
         
-        # Calculate output dimensions based on stereo format
-        
+        # Calculate output dimensions based on stereo format and target size
         output_width, output_height = self.calculate_output_dimensions(video_info)
         print(f"Output depth dimensions: {output_width}x{output_height}")
         
@@ -496,6 +522,8 @@ class UniMatchStereoDepthExtractor:
                             cache_path, video_info, output_height, output_width
                         )
                         print(f"Started depth video encoding: {output_video_path}")
+                        if self.target_output_size:
+                            print(f"Direct 4K output: {output_width}x{output_height}")
                     
                     # Split stereo frames into left/right pairs
                     frame_pairs = []
@@ -503,7 +531,7 @@ class UniMatchStereoDepthExtractor:
                         left, right = self.split_sbs_frame(frame)
                         frame_pairs.append((left, right))
                     
-                    # Process batch
+                    # Process batch (with direct 4K upscaling if enabled)
                     depth_maps = self.process_frame_batch(frame_pairs)
                     
                     # Write depth maps directly to video stream
@@ -531,6 +559,8 @@ class UniMatchStereoDepthExtractor:
                 if output_video_path and output_video_path.exists():
                     file_size_mb = output_video_path.stat().st_size / (1024 * 1024)
                     print(f"✓ Depth video created: {output_video_path} ({file_size_mb:.1f}MB)")
+                    if self.target_output_size:
+                        print(f"✅ Direct 4K extraction complete - no upscaling needed!")
                 else:
                     raise RuntimeError("Video encoding failed - output file not created")
         
@@ -577,6 +607,10 @@ def main():
                        help='Number of refinement iterations (default: 1 for speed)')
     parser.add_argument('--inference-size', type=int, nargs=2, default=[480, 854],
                        help='Inference size [height width] (default: [480, 854] for speed)')
+    parser.add_argument('--target-output-size', type=int, nargs=2, default=None,
+                       help='Direct output size [height width] for 4K (e.g., 2160 3840)')
+    parser.add_argument('--target-fps', type=float, default=None,
+                       help='Target output FPS (default: use source video FPS)')
     
     args = parser.parse_args()
     
@@ -586,6 +620,9 @@ def main():
     # Optimization suggestions
     if args.batch_size > 16 and args.inference_size is None:
         print("⚠️  Large batch size with full resolution may cause OOM. Consider --inference-size 480 854")
+    
+    if args.target_output_size and not args.inference_size:
+        print("⚠️  Direct 4K output without inference size may be slow. Consider --inference-size 480 854")
     
     try:
         # Initialize depth extractor
@@ -598,7 +635,9 @@ def main():
             unsqueeze_sbs=unsqueeze_sbs,
             num_scales=args.num_scales,
             num_reg_refine=args.num_reg_refine,
-            inference_size=args.inference_size
+            inference_size=args.inference_size,
+            target_output_size=args.target_output_size,
+            target_fps=args.target_fps
         )
         
         # Process video
@@ -611,6 +650,11 @@ def main():
         
         print(f"\n✓ Success! Depth maps saved to: {output_path}")
         
+        if args.target_output_size:
+            print(f"✅ Direct 4K extraction complete - ready for use!")
+        else:
+            print("💡 Consider using --target-output-size for direct 4K output")
+        
     except Exception as e:
         print(f"Error: {e}")
         return 1
@@ -620,3 +664,4 @@ def main():
 
 if __name__ == "__main__":
     exit(main())
+        

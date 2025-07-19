@@ -224,6 +224,80 @@ class SimpleDepthUpscaler:
         
         return result
 
+    def convert_depth_format(self, 
+                           input_video: str,
+                           output_path: str = None,
+                           force_reprocess: bool = False) -> str:
+        """ 	Convert depth video format/encoding without changing resolution -
+				used when depth is already at target resolution.
+
+		"""
+        
+        print(f"Converting depth video format...")
+        print(f"Input: {input_video}")
+        
+        if output_path is None:
+            input_path = Path(input_video)
+            output_path = f"depth_converted_{input_path.stem}.mp4"
+        
+        output_path = Path(output_path)
+        
+        # Check if already processed
+        if output_path.exists() and not force_reprocess:
+            print(f"✓ Using existing converted video: {output_path}")
+            return str(output_path)
+        
+        # Get input video info
+        try:
+            video_info = get_video_info(input_video)
+            if not video_info:
+                raise ValueError(f"Could not read input video info: {input_video}")
+            
+            fps = video_info['fps']
+            width = video_info['width']
+            height = video_info['height']
+            
+            print(f"Converting: {width}x{height} @ {fps}fps")
+            
+            # Convert format without changing resolution
+            stream = ffmpeg.input(input_video)
+            
+            # Choose encoder for optimal format
+            if self.use_nvenc:
+                # NVENC HEVC encoding - better compression for depth data                
+                stream = ffmpeg.output(stream, str(output_path), 
+                                     vcodec='hevc_nvenc', 
+                                     pix_fmt='yuv420p10le',  # 10-bit for better depth precision
+                                     rc='vbr', 
+                                     cq=18,  # Slightly better quality for final output
+                                     preset='p4', 
+                                     r=fps)
+            else:
+                # CPU HEVC encoding fallback
+                stream = ffmpeg.output(stream, str(output_path), 
+                                     vcodec='libx265', 
+                                     pix_fmt='yuv420p10le', 
+                                     crf=18, 
+                                     preset='medium', 
+                                     r=fps)
+            
+            # Run ffmpeg
+            print("Running format conversion...")
+            ffmpeg.run(stream, overwrite_output=True, quiet=False)
+            
+        except ffmpeg.Error as e:
+            print(f"FFmpeg error:")
+            if e.stderr:
+                print(e.stderr.decode())
+            raise RuntimeError(f"Format conversion failed: {e}")
+        
+        print(f"✓ Format conversion complete!")
+        print(f"  Input: {input_video}")
+        print(f"  Output: {output_path}")
+        print(f"  Resolution: {width}x{height} (unchanged)")
+        
+        return str(output_path)
+
 
 def main():
     """ Command line interface for simple depth upscaling """

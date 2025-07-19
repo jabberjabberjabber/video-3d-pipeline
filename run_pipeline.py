@@ -10,6 +10,7 @@ sys.path.insert(0, str(Path(__file__).parent / 'src'))
 from video_3d_pipeline.align import VideoAligner
 from video_3d_pipeline.upscale import SimpleDepthUpscaler
 from video_3d_pipeline.unimatch_depth import UniMatchStereoDepthExtractor
+from video_3d_pipeline.utils import get_video_info
 
 
 def run_pipeline(sbs_video: str, 
@@ -56,29 +57,34 @@ def run_pipeline(sbs_video: str,
         print("\nSkipping alignment step")
      
     if not skip_depth:
-        print("\n--- Step 2: Depth Extraction ---")
+        print("\n--- Step 2: Direct 4K Depth Extraction ---")
         step_start = time.time()
         
-        '''
-        extractor = IGEVStereoDepthExtractor(
-            work_dir=work_dir,
-            cache_dir=work_dir,
-            unsqueeze_sbs=True,  # Fix SBS aspect ratio
-            batch_size=8
-        )
-        '''
+        # Get 4K video dimensions for direct extraction
+        video_4k_info = get_video_info(video_4k)
+        if not video_4k_info:
+            raise ValueError(f"Could not read 4K video info: {video_4k}")
         
+        target_width = video_4k_info['width']
+        target_height = video_4k_info['height'] 
+        target_fps = video_4k_info['fps']
+        
+        print(f"4K target: {target_width}x{target_height} @ {target_fps:.1f}fps")
+        
+        # Create extractor with 4K output dimensions
         extractor = UniMatchStereoDepthExtractor(
             work_dir=work_dir,
             cache_dir=work_dir,
             unsqueeze_sbs=True,
             batch_size=4,
-            inference_size=[480, 854], 
+            inference_size=[480, 854],  # Keep fast inference, upscale at output
             num_reg_refine=1, 
-            num_scales=1
+            num_scales=1,
+            target_output_size=[target_height, target_width],  # Direct 4K output
+            target_fps=target_fps
         )
         
-        depth_dir = extractor.process_video_sbs(
+        depth_video_path = extractor.process_video_sbs(
             video_path=sbs_video,
             start_frame=start_frame,
             max_frames=max_frames,
@@ -87,40 +93,64 @@ def run_pipeline(sbs_video: str,
         
         results['depth'] = {
             'time': time.time() - step_start,
-            'output_dir': str(depth_dir)
+            'output_path': str(depth_video_path),
+            'resolution': f"{target_width}x{target_height}",
+            'direct_4k': True
         }
         
-        print(f"✓ Depth extraction: {results['depth']['time']:.1f}s")
-        print(f"  Output: {results['depth']['output_dir']}")
+        print(f"✓ Direct 4K depth extraction: {results['depth']['time']:.1f}s")
+        print(f"  Output: {results['depth']['output_path']}")
+        print(f"  Resolution: {results['depth']['resolution']}")
     else:
         print("\nSkipping depth extraction step")
         results['depth'] = {
-            'time': time.time() - step_start,
-            'output_dir': f"{work_dir}/depth_video.mp4"
+            'time': 0,
+            'output_path': f"{work_dir}/depth_video.mp4",
+            'direct_4k': False
         }
-        
     
+    # Upscaling step is now optional - only for format conversion or quality adjustments
     if not skip_upscale:
-        print("\n--- Step 3: Depth Upscaling ---")
+        print("\n--- Step 3: Optional Format Conversion ---")
         step_start = time.time()
         
-        upscaler = SimpleDepthUpscaler(use_nvenc=True)
-        depth_4k_video = upscaler.process_depth_upscaling(
-            depth_dir=results['depth']['output_dir'],
-            video_4k_path=video_4k,
-            output_path=f"{work_dir}/depth_final.mp4",
-            force_reprocess=force_reprocess
-        )
+        if results['depth'].get('direct_4k', False):
+            print("Depth already at 4K - converting format/encoding only")
+            
+            upscaler = SimpleDepthUpscaler(use_nvenc=True)
+            
+            # Just convert format without changing resolution
+            final_output = upscaler.convert_depth_format(
+                input_video=results['depth']['output_path'],
+                output_path=f"{work_dir}/depth_final.mp4",
+                force_reprocess=force_reprocess
+            )
+        else:
+            print("Legacy upscaling mode - scaling resolution")
+            
+            upscaler = SimpleDepthUpscaler(use_nvenc=True)
+            final_output = upscaler.process_depth_upscaling(
+                depth_dir=results['depth']['output_path'],
+                video_4k_path=video_4k,
+                output_path=f"{work_dir}/depth_final.mp4",
+                force_reprocess=force_reprocess
+            )
         
         results['upscale'] = {
             'time': time.time() - step_start,
-            'output_video': depth_4k_video
+            'output_video': final_output,
+            'operation': 'format_conversion' if results['depth'].get('direct_4k') else 'upscaling'
         }
         
-        print(f"✓ Upscaling: {results['upscale']['time']:.1f}s")
+        print(f"✓ {results['upscale']['operation'].title()}: {results['upscale']['time']:.1f}s")
         print(f"  Output: {results['upscale']['output_video']}")
     else:
-        print("\nSkipping upscaling step")
+        print("\nSkipping format conversion step")
+        results['upscale'] = {
+            'time': 0,
+            'output_video': results['depth']['output_path'],
+            'operation': 'skipped'
+        }
 
     
     total_time = time.time() - total_start
@@ -130,11 +160,12 @@ def run_pipeline(sbs_video: str,
     for step, data in results.items():
         print(f"  {step.capitalize()}: {data['time']:.1f}s")
     
-    print(f"\nNext steps:")
-    if not skip_upscale and 'upscale' in results:
-        print(f"✓ 4K video: {video_4k}")
-    else:
-        print("- Complete depth upscaling")
+    print(f"\nFinal outputs:")
+    print(f"✓ 4K RGB video: {video_4k}")
+    print(f"✓ 4K depth video: {results['upscale']['output_video']}")
+    
+    if results['depth'].get('direct_4k'):
+        print("✅ Optimized: Depth extracted directly at 4K (no upscaling needed)")
     
     return results
 
@@ -154,7 +185,7 @@ def main():
     parser.add_argument('--skip-depth', action='store_true', 
                        help='Skip depth extraction step')
     parser.add_argument('--skip-upscale', action='store_true',
-                       help='Skip upscaling step')
+                       help='Skip format conversion step (use raw depth video)')
     parser.add_argument('--force', action='store_true',
                        help='Force reprocessing of all steps')
     
