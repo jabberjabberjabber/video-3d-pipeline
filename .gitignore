@@ -95,5 +95,7 @@ src/video_3d_pipeline/_upscale.py
 /IGEV__
 /models
 /src/video_3d_pipeline/depth
-/VisionDepth3D-Main-Stable
-/VisionDepth3D
+/everest_depth
+_stereo_generator.py
+extract_aligned.py
+run_pipeline.py

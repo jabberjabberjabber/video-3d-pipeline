@@ -34,15 +34,6 @@ from dataloader.stereo import transforms
 
 from .utils import get_video_info, create_work_directory
 
-class StereoFormat(Enum):
-    """ Supported stereoscopic video formats """
-    HALF_SBS = "half_sbs"          # Side-by-side, each eye 50% width
-    FULL_SBS = "full_sbs"          # Side-by-side, each eye full width  
-    TOP_BOTTOM = "top_bottom"      # Top-bottom, each eye 50% height
-    ANAGLYPH = "anaglyph"          # Red/cyan composite
-    INTERLACED = "interlaced"      # Line-by-line interlaced
-
-
 # ImageNet normalization constants
 IMAGENET_MEAN = [0.485, 0.456, 0.406]
 IMAGENET_STD = [0.229, 0.224, 0.225]
@@ -57,8 +48,7 @@ class UniMatchStereoDepthExtractor:
                  cache_dir: str = "temp_depth",
                  device: str = "cuda",
                  batch_size: int = 32,  # Increased for RTX 3080
-                 stereo_format: StereoFormat = StereoFormat.HALF_SBS,  # NEW: Stereo format
-                 unsqueeze_sbs: bool = True,  # Only applies to SBS formats
+                 unsqueeze_sbs: bool = True,
                  # UniMatch model parameters (optimized for speed)
                  num_scales: int = 1,  # Single scale for speed
                  feature_channels: int = 128,
@@ -79,7 +69,6 @@ class UniMatchStereoDepthExtractor:
         self.work_dir = create_work_directory(work_dir)
         self.cache_dir = create_work_directory(cache_dir)
         self.batch_size = batch_size
-        self.stereo_format = stereo_format  # NEW: Store stereo format
         self.unsqueeze_sbs = unsqueeze_sbs
         self.model_checkpoint = model_checkpoint
         self.padding_factor = padding_factor
@@ -99,7 +88,7 @@ class UniMatchStereoDepthExtractor:
         self.reg_refine = reg_refine
         self.num_reg_refine = num_reg_refine
         self.attn_type = attn_type
-        self.attn_splits_list = attn_splits_list or [2]  # Simplified for speed
+        self.attn_splits_list = attn_splits_list or [1]  # Simplified for speed
         self.corr_radius_list = corr_radius_list or [-1]  # Global correlation only
         self.prop_radius_list = prop_radius_list or [-1]  # Global propagation only
         
@@ -195,19 +184,17 @@ class UniMatchStereoDepthExtractor:
     
     def get_cache_path(self, video_path: str, frame_start: int, frame_count: int) -> Path:
         """ Generate cache path for depth maps """
-        # Create cache key from video path, frame range, and stereo format
-        cache_key = f"{video_path}_{frame_start}_{frame_count}_{self.model_checkpoint}_{self.stereo_format.value}_{self.unsqueeze_sbs}"
+        # Create cache key from video path and frame range
+        cache_key = f"{video_path}_{frame_start}_{frame_count}_{self.model_checkpoint}_{self.unsqueeze_sbs}"
         cache_hash = hashlib.md5(cache_key.encode()).hexdigest()[:16]
         
         cache_subdir = self.cache_dir / f"depth_{cache_hash}"
         cache_subdir.mkdir(exist_ok=True)
         
         return cache_subdir
-    
     def is_cached(self, cache_path: Path, frame_count: int) -> bool:
         """ Check if depth video is already cached (legacy method for compatibility) """
         return self.is_video_cached(cache_path)
-
     def get_frame_generator(self, video_path: str, start_frame: int = 0, max_frames: int = None):
         """ Generator that yields frames one at a time to avoid memory issues """
         print(f"Setting up frame generator for {video_path}...")
@@ -253,100 +240,23 @@ class UniMatchStereoDepthExtractor:
             cap.release()
             raise RuntimeError(f"Frame extraction failed: {e}")
         
-    def split_stereo_frame(self, stereo_frame: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        """ Split stereoscopic frame into left and right images based on format """
-        height, width = stereo_frame.shape[:2]
+    def split_sbs_frame(self, sbs_frame: np.ndarray, unsqueeze: bool = True) -> Tuple[np.ndarray, np.ndarray]:
+        """ Split side-by-side frame into left and right images """
+        height, width = sbs_frame.shape[:2]
         
-        if self.stereo_format == StereoFormat.HALF_SBS:
-            # Side-by-side, each eye compressed horizontally
-            if width % 2 != 0:
-                raise ValueError("Half SBS frame width must be even")
-            
-            half_width = width // 2
-            left_frame = stereo_frame[:, :half_width]
-            right_frame = stereo_frame[:, half_width:]
-            
-            # Unsqueeze horizontally to restore proper aspect ratio if requested
-            if self.unsqueeze_sbs:
-                target_width = half_width * 2
-                left_frame = cv2.resize(left_frame, (target_width, height), interpolation=cv2.INTER_LANCZOS4)
-                right_frame = cv2.resize(right_frame, (target_width, height), interpolation=cv2.INTER_LANCZOS4)
+        if width % 2 != 0:
+            raise ValueError("SBS frame width must be even")
         
-        elif self.stereo_format == StereoFormat.FULL_SBS:
-            # Side-by-side, each eye at full resolution (double-width video)
-            if width % 2 != 0:
-                raise ValueError("Full SBS frame width must be even")
-            
-            half_width = width // 2
-            left_frame = stereo_frame[:, :half_width]
-            right_frame = stereo_frame[:, half_width:]
-            # No unsqueezing needed - already full resolution
+        half_width = width // 2
+        left_frame = sbs_frame[:, :half_width]
+        right_frame = sbs_frame[:, half_width:]
         
-        elif self.stereo_format == StereoFormat.TOP_BOTTOM:
-            # Top-bottom, each eye compressed vertically
-            if height % 2 != 0:
-                raise ValueError("Top-bottom frame height must be even")
-            
-            half_height = height // 2
-            left_frame = stereo_frame[:half_height, :]
-            right_frame = stereo_frame[half_height:, :]
-            
-            # Unsqueeze vertically to restore proper aspect ratio if requested
-            if self.unsqueeze_sbs:  # Reuse flag for consistency
-                target_height = half_height * 2
-                left_frame = cv2.resize(left_frame, (width, target_height), interpolation=cv2.INTER_LANCZOS4)
-                right_frame = cv2.resize(right_frame, (width, target_height), interpolation=cv2.INTER_LANCZOS4)
-        
-        elif self.stereo_format == StereoFormat.ANAGLYPH:
-            # Red/cyan anaglyph - extract channels
-            if len(stereo_frame.shape) != 3 or stereo_frame.shape[2] != 3:
-                raise ValueError("Anaglyph requires RGB color image")
-            
-            # Left eye from red channel, right eye from cyan (green+blue)
-            left_frame = np.zeros_like(stereo_frame)
-            right_frame = np.zeros_like(stereo_frame)
-            
-            # Left eye: red channel to all channels (grayscale)
-            left_frame[:, :, 0] = stereo_frame[:, :, 0]  # Red
-            left_frame[:, :, 1] = stereo_frame[:, :, 0]  # Red -> Green
-            left_frame[:, :, 2] = stereo_frame[:, :, 0]  # Red -> Blue
-            
-            # Right eye: cyan channels (average green and blue)
-            cyan = (stereo_frame[:, :, 1].astype(np.float32) + stereo_frame[:, :, 2].astype(np.float32)) / 2
-            cyan = cyan.astype(np.uint8)
-            right_frame[:, :, 0] = cyan  # Cyan -> Red
-            right_frame[:, :, 1] = cyan  # Cyan -> Green  
-            right_frame[:, :, 2] = cyan  # Cyan -> Blue
-        
-        elif self.stereo_format == StereoFormat.INTERLACED:
-            # Line-by-line interlaced
-            left_frame = np.zeros_like(stereo_frame)
-            right_frame = np.zeros_like(stereo_frame)
-            
-            # Extract alternating lines
-            left_frame[::2, :] = stereo_frame[::2, :]    # Even lines (0, 2, 4, ...)
-            right_frame[1::2, :] = stereo_frame[1::2, :] # Odd lines (1, 3, 5, ...)
-            
-            # Interpolate missing lines
-            # For left eye, interpolate odd lines
-            for y in range(1, height, 2):
-                if y < height - 1:
-                    left_frame[y, :] = (left_frame[y-1, :].astype(np.float32) + left_frame[y+1, :].astype(np.float32)) / 2
-                else:
-                    left_frame[y, :] = left_frame[y-1, :]
-            
-            # For right eye, interpolate even lines  
-            for y in range(0, height, 2):
-                if y < height - 2:
-                    right_frame[y, :] = (right_frame[y+1, :].astype(np.float32) + right_frame[y+3, :].astype(np.float32)) / 2
-                else:
-                    right_frame[y, :] = right_frame[y+1, :]
-            
-            left_frame = left_frame.astype(np.uint8)
-            right_frame = right_frame.astype(np.uint8)
-        
-        else:
-            raise ValueError(f"Unsupported stereo format: {self.stereo_format}")
+        # Unsqueeze horizontally to restore proper aspect ratio
+        # SBS typically compresses each eye horizontally by 50%
+        if unsqueeze:
+            target_width = half_width * 2  # Restore original width
+            left_frame = cv2.resize(left_frame, (target_width, height), interpolation=cv2.INTER_LANCZOS4)
+            right_frame = cv2.resize(right_frame, (target_width, height), interpolation=cv2.INTER_LANCZOS4)
         
         return left_frame, right_frame
     
@@ -453,13 +363,22 @@ class UniMatchStereoDepthExtractor:
                     
             except Exception as e:
                 print(f"Error processing frame batch: {e}")
-                # Create dummy depth maps on error
-                for left_frame, right_frame in frame_pairs:
-                    h, w = left_frame.shape[:2]
-                    depth_maps.append(np.zeros((h, w), dtype=np.float32))
+                import traceback
+                traceback.print_exc()
         
         return depth_maps
     
+    def save_depth_map(self, depth_map: np.ndarray, output_path: Path):
+        """ Save depth map as 16-bit PNG """
+        # Convert to 16-bit for saving
+        depth_16bit = np.round(depth_map * 65535).astype(np.uint16)
+        
+        # Ensure output directory exists
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        
+        # Save using skimage
+        skimage.io.imsave(str(output_path), depth_16bit)
+            
     def create_depth_video_writer(self, cache_path: Path, video_info: dict, output_height: int, output_width: int):
         """ Create FFmpeg video writer for depth maps """
         output_video_path = cache_path / "depth_video.mp4"
@@ -490,55 +409,24 @@ class UniMatchStereoDepthExtractor:
             # Write raw bytes to ffmpeg pipe
             video_writer.stdin.write(depth_16bit.tobytes())
     
+    
     def calculate_output_dimensions(self, video_info: dict) -> Tuple[int, int]:
         """ Calculate output depth map dimensions based on stereo format """
         input_width = video_info['width']
         input_height = video_info['height']
+        eye_width = input_width // 2
+        eye_height = input_height
         
-        if self.stereo_format in [StereoFormat.HALF_SBS, StereoFormat.FULL_SBS]:
-            # Side-by-side formats
-            if self.stereo_format == StereoFormat.HALF_SBS:
-                # Each eye is half width
-                eye_width = input_width // 2
-                eye_height = input_height
-                
-                if self.unsqueeze_sbs:
-                    # Restore to full aspect ratio
-                    output_width = eye_width * 2
-                    output_height = eye_height
-                else:
-                    # Keep compressed aspect ratio
-                    output_width = eye_width
-                    output_height = eye_height
-            else:  # FULL_SBS
-                # Each eye is half of double-width video
-                output_width = input_width // 2  # Full resolution per eye
-                output_height = input_height
-        
-        elif self.stereo_format == StereoFormat.TOP_BOTTOM:
-            # Top-bottom format
-            eye_width = input_width
-            eye_height = input_height // 2
-            
-            if self.unsqueeze_sbs:  # Reuse flag for consistency
-                # Restore to full aspect ratio
-                output_width = eye_width
-                output_height = eye_height * 2
-            else:
-                # Keep compressed aspect ratio
-                output_width = eye_width
-                output_height = eye_height
-        
-        elif self.stereo_format in [StereoFormat.ANAGLYPH, StereoFormat.INTERLACED]:
-            # Full frame formats
-            output_width = input_width
-            output_height = input_height
-        
+        if self.unsqueeze_sbs:
+            # Restore to full aspect ratio
+            output_width = eye_width * 2
+            output_height = eye_height
         else:
-            raise ValueError(f"Unsupported stereo format: {self.stereo_format}")
+            # Keep compressed aspect ratio
+            output_width = eye_width
+            output_height = eye_height
         
-        return output_width, output_height
-    
+        return output_width, output_height    
     def is_video_cached(self, cache_path: Path) -> bool:
         """ Check if depth video is already cached """
         video_path = cache_path / "depth_video.mp4"
@@ -567,9 +455,9 @@ class UniMatchStereoDepthExtractor:
         
         print(f"Video info: {video_info['width']}x{video_info['height']} @ {video_info['fps']:.1f}fps")
         print(f"Processing {frame_count} frames starting from frame {start_frame}")
-        print(f"Stereo format: {self.stereo_format.value}")
         
         # Calculate output dimensions based on stereo format
+        
         output_width, output_height = self.calculate_output_dimensions(video_info)
         print(f"Output depth dimensions: {output_width}x{output_height}")
         
@@ -612,7 +500,7 @@ class UniMatchStereoDepthExtractor:
                     # Split stereo frames into left/right pairs
                     frame_pairs = []
                     for frame in batch_frames:
-                        left, right = self.split_stereo_frame(frame)
+                        left, right = self.split_sbs_frame(frame)
                         frame_pairs.append((left, right))
                     
                     # Process batch
@@ -681,11 +569,8 @@ def main():
                        help='Force reprocessing even if cached results exist')
     parser.add_argument('--device', default='cuda',
                        help='Processing device (default: cuda)')
-    parser.add_argument('--stereo-format', choices=[f.value for f in StereoFormat], 
-                       default=StereoFormat.HALF_SBS.value,
-                       help='Stereoscopic input format (default: half_sbs)')
     parser.add_argument('--no-unsqueeze', action='store_true',
-                       help='Skip aspect ratio restoration for compressed formats')
+                       help='Skip SBS unsqueezing (keep squeezed aspect ratio)')
     parser.add_argument('--num-scales', type=int, default=1,
                        help='Number of feature scales (default: 1 for speed)')
     parser.add_argument('--num-reg-refine', type=int, default=1,
@@ -696,7 +581,6 @@ def main():
     args = parser.parse_args()
     
     # Handle flags
-    stereo_format = StereoFormat(args.stereo_format)
     unsqueeze_sbs = not args.no_unsqueeze
     
     # Optimization suggestions
@@ -711,7 +595,6 @@ def main():
             cache_dir=args.work_dir,
             device=args.device,
             batch_size=args.batch_size,
-            stereo_format=stereo_format,
             unsqueeze_sbs=unsqueeze_sbs,
             num_scales=args.num_scales,
             num_reg_refine=args.num_reg_refine,

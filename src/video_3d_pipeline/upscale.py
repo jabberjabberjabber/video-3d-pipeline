@@ -51,12 +51,22 @@ class SimpleDepthUpscaler:
             
             # Choose encoder
             if self.use_nvenc:
-            
-            # NVENC GPU encoding                
-                stream = ffmpeg.output(stream, output_path, vcodec='h264_nvenc', pix_fmt='yuv420p', crf=18, preset='medium', r=fps)
+                # NVENC HEVC encoding - better compression for depth data               
+                stream = ffmpeg.output(stream, output_path, 
+                                     vcodec='hevc_nvenc', 
+                                     pix_fmt='yuv420p10le',  # 10-bit for better depth precision
+                                     rc='vbr', 
+                                     cq=20, 
+                                     preset='p4', 
+                                     r=fps)
             else:
-                # CPU encoding fallback
-                stream = ffmpeg.output(stream, output_path, vcodec='libx264', pix_fmt='yuv420p', crf=18, preset='medium', r=fps)
+                # CPU HEVC encoding fallback
+                stream = ffmpeg.output(stream, output_path, 
+                                     vcodec='libx265', 
+                                     pix_fmt='yuv420p10le', 
+                                     crf=20, 
+                                     preset='medium', 
+                                     r=fps)
                 
             # Run ffmpeg
             print("Running ffmpeg...")
@@ -72,15 +82,74 @@ class SimpleDepthUpscaler:
         print(f"✓ Depth video saved: {output_path}")
         return output_path
 
+    def upscale_depth_video_ffmpeg(self, 
+                                   depth_video_path: str,
+                                   target_width: int, 
+                                   target_height: int,
+                                   output_path: str,
+                                   fps: float = 23.976):
+        """ 	Upscale depth video directly using ffmpeg - more efficient than
+				processing individual frames.
+				
+		"""
+        
+        print(f"Processing depth video upscaling with ffmpeg...")
+        print(f"Input: {depth_video_path}")
+        print(f"Output: {output_path}")
+        print(f"Target: {target_width}x{target_height} @ {fps}fps")
+        
+        try:
+            # Build ffmpeg command for video-to-video scaling
+            stream = ffmpeg.input(depth_video_path)
+            
+            # Scale to target resolution
+            stream = ffmpeg.filter(stream, 'scale', target_width, target_height)
+            
+            # Choose encoder
+            if self.use_nvenc:
+                # NVENC HEVC encoding - better compression for depth data                
+                stream = ffmpeg.output(stream, output_path, 
+                                     vcodec='hevc_nvenc', 
+                                     pix_fmt='yuv420p10le',  # 10-bit for better depth precision
+                                     rc='vbr', 
+                                     cq=20, 
+                                     preset='p4', 
+                                     r=fps)
+            else:
+                # CPU HEVC encoding fallback
+                stream = ffmpeg.output(stream, output_path, 
+                                     vcodec='libx265', 
+                                     pix_fmt='yuv420p10le', 
+                                     crf=20, 
+                                     preset='medium', 
+                                     r=fps)
+                
+            # Run ffmpeg
+            print("Running ffmpeg...")
+            ffmpeg.run(stream, overwrite_output=True, quiet=False)
+            
+        except ffmpeg.Error as e:
+            print(f"FFmpeg error:")
+            
+            if e.stderr:
+                print(e.stderr.decode())
+                raise RuntimeError(f"FFmpeg processing failed: {e}")
+                
+        print(f"✓ Upscaled depth video saved: {output_path}")
+        return output_path
+
     def process_depth_upscaling(self, 
                                depth_dir: str,
                                video_4k_path: str,
                                output_path: str = None,
                                force_reprocess: bool = False) -> str:
-        """ Main pipeline for depth upscaling """
+        """ 	Main pipeline for depth upscaling - handles both individual 
+				images and video input.
+
+		"""
         
         print(f"Processing depth upscaling...")
-        print(f"Depth maps: {depth_dir}")
+        print(f"Depth input: {depth_dir}")
         print(f"4K video: {video_4k_path}")
         
         # Get target dimensions from 4K video
@@ -106,14 +175,47 @@ class SimpleDepthUpscaler:
             print(f"✓ Using existing depth video: {output_path}")
             return str(output_path)
         
-        # Process with ffmpeg
-        result = self.upscale_depth_maps_ffmpeg(
-            depth_dir=depth_dir,
-            target_width=target_width,
-            target_height=target_height,
-            output_path=str(output_path),
-            fps=fps
-        )
+        # Determine input type: video file or directory with images
+        depth_path = Path(depth_dir)
+        
+        # Check if it's a video file
+        if depth_path.is_file() and depth_path.suffix.lower() in ['.mp4', '.avi', '.mov', '.mkv']:
+            print(f"Input is video file: {depth_path}")
+            result = self.upscale_depth_video_ffmpeg(
+                depth_video_path=str(depth_path),
+                target_width=target_width,
+                target_height=target_height,
+                output_path=str(output_path),
+                fps=fps
+            )
+        
+        # Check if it's a directory or path to depth_video.mp4
+        elif depth_path.is_dir():
+            # Check for depth_video.mp4 in the directory (UniMatch output)
+            depth_video_path = depth_path / "depth_video.mp4"
+            
+            if depth_video_path.exists():
+                print(f"Found depth video in directory: {depth_video_path}")
+                result = self.upscale_depth_video_ffmpeg(
+                    depth_video_path=str(depth_video_path),
+                    target_width=target_width,
+                    target_height=target_height,
+                    output_path=str(output_path),
+                    fps=fps
+                )
+            else:
+                # Fall back to individual image processing
+                print(f"Looking for individual depth maps in directory: {depth_path}")
+                result = self.upscale_depth_maps_ffmpeg(
+                    depth_dir=str(depth_path),
+                    target_width=target_width,
+                    target_height=target_height,
+                    output_path=str(output_path),
+                    fps=fps
+                )
+        
+        else:
+            raise ValueError(f"Invalid depth input: {depth_dir}. Must be a video file or directory.")
         
         print(f"✓ Depth upscaling complete!")
         print(f"  Input: {depth_dir}")
@@ -126,7 +228,7 @@ class SimpleDepthUpscaler:
 def main():
     """ Command line interface for simple depth upscaling """
     parser = argparse.ArgumentParser(description='Simple depth upscaling using ffmpeg')
-    parser.add_argument('depth_dir', help='Directory containing depth maps')
+    parser.add_argument('depth_input', help='Directory containing depth maps or path to depth video')
     parser.add_argument('video_4k', help='Path to 4K 2D video (for dimensions)')
     parser.add_argument('--output', help='Output path for 4K depth video')
     parser.add_argument('--no-nvenc', action='store_true',
@@ -142,7 +244,7 @@ def main():
         
         # Process upscaling
         output_path = upscaler.process_depth_upscaling(
-            depth_dir=args.depth_dir,
+            depth_dir=args.depth_input,
             video_4k_path=args.video_4k,
             output_path=args.output,
             force_reprocess=args.force
