@@ -188,73 +188,215 @@ def generate_stereo_video_nvenc(video_path: str,
 
 
 def create_stereo_chunk(frames: torch.Tensor, depths: torch.Tensor, parallax_strength: float) -> torch.Tensor:
-    """Convert frames to Half-SBS stereo on GPU."""
+    """
+    Create Half-SBS stereo using single-eye approach:
+    - Left eye: Original frame (perfect quality)
+    - Right eye: Depth-warped frame
+    """
     
     B, C, H, W = frames.shape
     device = frames.device
     
-    # Fixed depth normalization (no quantile issues)
-    depths_norm = normalize_depth_fixed(depths)
+    # Normalize depth maps with robust percentile method
+    depths_norm = normalize_depth_robust(depths)
     
-    # Create coordinate grids
-    y_coords, x_coords = torch.meshgrid(
-        torch.linspace(-1, 1, H, device=device),
-        torch.linspace(-1, 1, W, device=device),
-        indexing='ij'
-    )
+    # Estimate subject depth for zero-parallax adjustment
+    subject_depths = estimate_subject_depth_batch(depths_norm)
     
-    # Create horizontal shift based on depth
-    max_shift_pixels = parallax_strength * W
-    shift_amounts = depths_norm.squeeze(1) * max_shift_pixels
-    shift_normalized = (shift_amounts * 2.0) / W
+    # Generate right eye by warping original frames
+    right_eyes = []
     
-    # Create sampling grid for right eye
-    x_shifted = x_coords.unsqueeze(0).repeat(B, 1, 1) + shift_normalized
-    x_shifted = torch.clamp(x_shifted, -1, 1)
+    for i in range(B):
+        frame = frames[i]  # [C, H, W]
+        depth = depths_norm[i]  # [1, H, W]
+        subject_depth = subject_depths[i]  # scalar
+        
+        # Create right eye using forward warping
+        right_eye = forward_warp_right_eye(frame, depth, subject_depth, parallax_strength, W)
+        right_eyes.append(right_eye)
     
-    y_grid = y_coords.unsqueeze(0).repeat(B, 1, 1)
-    grid_right = torch.stack([x_shifted, y_grid], dim=-1)
-    
-    # Generate right eye view
-    right_eye = F.grid_sample(frames, grid_right, mode='bilinear', 
-                             padding_mode='border', align_corners=True)
+    right_eyes_tensor = torch.stack(right_eyes)
     
     # Create Half-SBS output
+    # Left half: original frames (downscaled) - PERFECT quality
     left_half = F.interpolate(frames, size=(H, W//2), mode='bilinear', align_corners=False)
-    right_half = F.interpolate(right_eye, size=(H, W//2), mode='bilinear', align_corners=False)
     
+    # Right half: warped frames (downscaled)
+    right_half = F.interpolate(right_eyes_tensor, size=(H, W//2), mode='bilinear', align_corners=False)
+    
+    # Concatenate horizontally for Half-SBS
     return torch.cat([left_half, right_half], dim=3)
 
 
-def normalize_depth_fixed(depth: torch.Tensor) -> torch.Tensor:
-    """Fixed depth normalization without quantile memory issues."""
+def normalize_depth_robust(depth: torch.Tensor) -> torch.Tensor:
+    """
+    Robust depth normalization using percentiles to handle outliers.
+    """
     
-    # Flatten and sample for percentile calculation
-    depth_flat = depth.flatten()
+    B = depth.shape[0]
+    normalized = torch.zeros_like(depth)
     
-    if depth_flat.numel() > 100000:
-        # Sample random subset
-        sample_size = min(10000, depth_flat.numel())
-        indices = torch.randperm(depth_flat.numel(), device=depth.device)[:sample_size]
-        sample = depth_flat[indices]
+    for i in range(B):
+        d = depth[i].flatten()
         
-        # Manual percentile calculation
-        sample_sorted = torch.sort(sample)[0]
-        p2_idx = max(0, int(0.02 * len(sample_sorted)))
-        p98_idx = min(len(sample_sorted)-1, int(0.98 * len(sample_sorted)))
+        # Use percentiles for robust normalization
+        if d.numel() > 1000:
+            # Sample for efficiency on large tensors
+            sample_size = min(5000, d.numel())
+            indices = torch.randperm(d.numel(), device=d.device)[:sample_size]
+            sample = d[indices]
+            sample_sorted = torch.sort(sample)[0]
+            
+            p5_idx = max(0, int(0.05 * len(sample_sorted)))
+            p95_idx = min(len(sample_sorted)-1, int(0.95 * len(sample_sorted)))
+            
+            d_min = sample_sorted[p5_idx]
+            d_max = sample_sorted[p95_idx]
+        else:
+            d_min = d.quantile(0.05)
+            d_max = d.quantile(0.95)
         
-        depth_min = sample_sorted[p2_idx]
-        depth_max = sample_sorted[p98_idx]
-    else:
-        # Small tensor, use direct min/max
-        depth_min = depth.min()
-        depth_max = depth.max()
+        # Normalize to [0, 1]
+        if d_max > d_min:
+            normalized[i] = (torch.clamp(depth[i], d_min, d_max) - d_min) / (d_max - d_min)
+        else:
+            normalized[i] = torch.ones_like(depth[i]) * 0.5
     
-    # Normalize
-    if depth_max > depth_min:
-        return (torch.clamp(depth, depth_min, depth_max) - depth_min) / (depth_max - depth_min)
-    else:
-        return torch.zeros_like(depth)
+    return normalized
+
+
+def forward_warp_right_eye(frame: torch.Tensor, depth: torch.Tensor, 
+                          subject_depth: float, parallax_strength: float, width: int) -> torch.Tensor:
+    """
+    Forward warp frame to create right eye view using depth-based disparity.
+    """
+    
+    C, H, W = frame.shape
+    device = frame.device
+    
+    # Calculate disparity based on depth difference from subject
+    depth_diff = depth.squeeze(0) - subject_depth  # [H, W]
+    
+    # Apply smoothing to reduce aliasing
+    depth_diff = F.avg_pool2d(
+        depth_diff.unsqueeze(0).unsqueeze(0), 
+        kernel_size=3, stride=1, padding=1
+    ).squeeze()
+    
+    # Convert depth difference to pixel disparity with reduced strength
+    max_disparity_pixels = parallax_strength * width * 0.5  # Reduce by half
+    disparity = depth_diff * max_disparity_pixels  # [H, W]
+    
+    # Quantize disparity to reduce sub-pixel oscillations
+    disparity = torch.round(disparity * 4.0) / 4.0  # Quarter-pixel precision
+    
+    # Create sampling grid for right eye
+    y_coords, x_coords = torch.meshgrid(
+        torch.linspace(-1, 1, H, device=device),
+        torch.linspace(-1, 1, W, device=device), 
+        indexing='ij'
+    )
+    
+    # Convert pixel disparity to normalized coordinates
+    disparity_norm = (disparity * 2.0) / W  # Convert to [-1, 1] range
+    
+    # Apply disparity shift with clamping
+    x_shifted = x_coords - disparity_norm  # Subtract for right eye view
+    x_shifted = torch.clamp(x_shifted, -0.99, 0.99)  # Tighter clamp to avoid edge artifacts
+    
+    # Create sampling grid
+    grid = torch.stack([x_shifted, y_coords], dim=-1)  # [H, W, 2]
+    grid = grid.unsqueeze(0)  # [1, H, W, 2]
+    frame_batch = frame.unsqueeze(0)  # [1, C, H, W]
+    
+    # Sample right eye view with antialiasing
+    right_eye = F.grid_sample(frame_batch, grid, mode='bilinear', 
+                             padding_mode='reflection', align_corners=False)  # Use reflection padding
+    
+    right_eye = right_eye.squeeze(0)  # [C, H, W]
+    
+    # Apply gentle smoothing to reduce remaining artifacts
+    right_eye = F.avg_pool2d(
+        right_eye.unsqueeze(0), 
+        kernel_size=3, stride=1, padding=1
+    ).squeeze(0) * 0.7 + right_eye * 0.3
+    
+    # Apply hole filling
+    right_eye = fill_holes_simple(right_eye, frame)
+    
+    return right_eye
+
+
+def estimate_subject_depth_batch(depths: torch.Tensor) -> torch.Tensor:
+    """
+    Estimate subject depth for each frame in batch using center-weighted approach.
+    """
+    
+    B, _, H, W = depths.shape
+    subject_depths = torch.zeros(B, device=depths.device)
+    
+    for i in range(B):
+        depth = depths[i, 0]  # [H, W]
+        
+        # Focus on center region (typical subject location)
+        center_h_start, center_h_end = H//4, H*3//4
+        center_w_start, center_w_end = W//4, W*3//4
+        
+        center_region = depth[center_h_start:center_h_end, center_w_start:center_w_end]
+        
+        # Use histogram peak to find dominant depth (likely subject)
+        valid_depths = center_region[(center_region > 0.1) & (center_region < 0.9)]
+        
+        if valid_depths.numel() > 20:
+            # Find histogram peak
+            hist = torch.histc(valid_depths, bins=32, min=0.0, max=1.0)
+            peak_bin = torch.argmax(hist)
+            subject_depth = (peak_bin.float() + 0.5) / 32.0
+            
+            # Blend with median for stability
+            median_depth = torch.median(valid_depths)
+            subject_depths[i] = 0.7 * subject_depth + 0.3 * median_depth
+        else:
+            subject_depths[i] = 0.5  # fallback
+    
+    return subject_depths
+
+
+def fill_holes_simple(warped_frame: torch.Tensor, original_frame: torch.Tensor) -> torch.Tensor:
+    """
+    Simple hole filling by blending with original frame where artifacts are detected.
+    """
+    
+    C, H, W = warped_frame.shape
+    
+    # Detect potential holes/artifacts by looking for high-frequency noise
+    gray_warped = warped_frame.mean(dim=0)  # [H, W]
+    
+    # Compute gradient magnitude to detect discontinuities
+    grad_x = F.pad(gray_warped[:, 1:] - gray_warped[:, :-1], (1, 0))
+    grad_y = F.pad(gray_warped[1:, :] - gray_warped[:-1, :], (0, 0, 1, 0))
+    grad_mag = torch.sqrt(grad_x**2 + grad_y**2)
+    
+    # Create artifact mask (high gradient areas likely have artifacts)
+    artifact_threshold = 0.1
+    artifact_mask = (grad_mag > artifact_threshold).float()
+    
+    # Smooth the mask to avoid hard edges
+    kernel_size = 5
+    artifact_mask = F.avg_pool2d(
+        artifact_mask.unsqueeze(0).unsqueeze(0), 
+        kernel_size, stride=1, padding=kernel_size//2
+    ).squeeze()
+    
+    # Expand mask to all channels
+    artifact_mask = artifact_mask.unsqueeze(0).expand(C, -1, -1)
+    
+    # Blend warped frame with original where artifacts detected
+    blend_strength = 0.3
+    filled_frame = (1 - blend_strength * artifact_mask) * warped_frame + \
+                   (blend_strength * artifact_mask) * original_frame
+    
+    return filled_frame
 
 
 def write_yuv420_chunk(stereo_frames: torch.Tensor, raw_file):
@@ -288,7 +430,7 @@ def encode_with_nvenc(raw_file: Path, output_path: str, width: int, height: int,
         '-i', str(raw_file),
         '-c:v', 'hevc_nvenc',
         '-preset', 'slow',
-        '-crf', '25',
+        '-crf', '20',
         '-movflags', '+faststart',
         output_path
     ]
@@ -323,13 +465,13 @@ if __name__ == "__main__":
             video_path=args.video_path,
             depth_path=args.depth_path, 
             output_path=args.output_path,
-            parallax_strength=0.025,
-            chunk_size=4,
+            parallax_strength=0.01,
+            chunk_size=12,
             start_frame=args.start_frame,
             end_frame=end_frame,
             depth_start_frame=args.start_frame,
             nvenc_preset="p4",
-            crf=20
+            crf=23
             )        
         print("\n🎉 Stereo video completed successfully!")
         

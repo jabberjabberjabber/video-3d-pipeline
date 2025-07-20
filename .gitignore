@@ -99,3 +99,4 @@ src/video_3d_pipeline/_upscale.py
 _stereo_generator.py
 extract_aligned.py
 run_pipeline.py
+/_temp_pipeline
