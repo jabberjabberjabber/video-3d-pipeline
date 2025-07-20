@@ -10,6 +10,7 @@ from pathlib import Path
 import time
 import subprocess
 import tempfile
+import argparse
 from typing import Optional
 
 
@@ -135,7 +136,7 @@ def generate_stereo_video_nvenc(video_path: str,
                     video_frames.append(frame_rgb)
                     depth_frames.append(depth_gray)
                 
-                print(f"Read {len(video_frames)} frames in this chunk")
+                #print(f"Read {len(video_frames)} frames in this chunk")
                 
                 if not video_frames:
                     print("No frames read, breaking")
@@ -301,15 +302,39 @@ def encode_with_nvenc(raw_file: Path, output_path: str, width: int, height: int,
 
 
 if __name__ == "__main__":
-    generate_stereo_video_nvenc(
-        video_path="./everest/Everest-2160p-2D.mp4",
-        depth_path="./everest/depth_4k_final.mp4", 
-        output_path="output_3d_half_sbs_nvenc.mp4",
-        parallax_strength=0.025,
-        chunk_size=4,         # Reduced for 4K frames
-        start_frame=8400,     # Start at frame 8400 in source video
-        end_frame=8900,       # End at frame 8900 in source video
-        depth_start_frame=0,  # Depth video starts at frame 0
-        nvenc_preset="p4",
-        crf=20
-    )
+    parser = argparse.ArgumentParser(description='Optimized 3D video pipeline')
+    parser.add_argument('video_path', help='Path to 4K 2D video')
+    parser.add_argument('depth_path', help='Path to 4K depth video')
+    parser.add_argument('--start-frame', type=int, default=0,
+                       help='Starting frame number (default: 0)')
+    parser.add_argument('--max-frames', type=int,
+                       help='Maximum frames to process')
+    parser.add_argument('--output-path', default="./video_3D_4K.mp4",
+                       help='Output path (default: video_3D_4K.mp4')
+    
+    args = parser.parse_args()
+    if args.max_frames:
+        end_frame = args.start_frame + args.max_frames
+    else:
+        end_frame = None
+    
+    try:
+        generate_stereo_video_nvenc(
+            video_path=args.video_path,
+            depth_path=args.depth_path, 
+            output_path=args.output_path,
+            parallax_strength=0.025,
+            chunk_size=4,
+            start_frame=args.start_frame,
+            end_frame=end_frame,
+            depth_start_frame=args.start_frame,
+            nvenc_preset="p4",
+            crf=20
+            )        
+        print("\n🎉 Stereo video completed successfully!")
+        
+    except Exception as e:
+        print(f"\n💥 Video creation failed: {e}")
+        import traceback
+        traceback.print_exc()
+
